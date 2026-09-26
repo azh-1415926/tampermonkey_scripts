@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页工具箱 · 查找模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.0.0
+// @version      1.0.1
 // @description  跨 iframe 文本检索高亮。依赖内核 wtb-core。
 // @author       you
 // @match        *://*/*
@@ -581,7 +581,9 @@
         const row2 = h('div', { class: 'wtb-row' }, [selEl]);
 
         inputEl = h('input', { type: 'text', placeholder: '输入要检索的文本，回车切换下一项' });
-        const row3 = h('div', { class: 'wtb-row' }, [inputEl]);
+        inputEl.style.flex = '1';
+        const clearBtn = h('button', { class: 'wtb-btn ghost', title: '清空输入框' }, '✕');
+        const row3 = h('div', { class: 'wtb-row' }, [inputEl, clearBtn]);
 
         prevBtn = h('button', { class: 'wtb-btn ghost' }, '↑ 上一个');
         prevBtn.style.flex = '1';
@@ -605,6 +607,9 @@
         pane.appendChild(row4);
         pane.appendChild(row5);
         pane.appendChild(statusEl);
+
+        const syncClearBtn = () => { clearBtn.disabled = !inputEl.value; };
+        syncClearBtn();
 
         filterEl.addEventListener('input', () => {
           filterKeyword = filterEl.value;
@@ -638,6 +643,7 @@
         });
 
         inputEl.addEventListener('input', () => {
+          syncClearBtn();
           clearTimeout(searchTimer);
           searchTimer = setTimeout(() => doSearch(inputEl.value.trim()), DEBOUNCE);
         });
@@ -650,11 +656,23 @@
             else doGoto(e.shiftKey ? -1 : 1);
           } else if (e.key === 'Escape') {
             inputEl.value = '';
+            syncClearBtn();
             clearTimeout(searchTimer);
             resetAllFramesHighlight();
             activeCount = 0; activeIndex = -1;
             updateStatus();
           }
+        });
+
+        clearBtn.addEventListener('click', () => {
+          inputEl.value = '';
+          syncClearBtn();
+          clearTimeout(searchTimer);
+          resetAllFramesHighlight();
+          activeCount = 0;
+          activeIndex = -1;
+          updateStatus();
+          inputEl.focus();
         });
 
         prevBtn.addEventListener('click', () => doGoto(-1));
