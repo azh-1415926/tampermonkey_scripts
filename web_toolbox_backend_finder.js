@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页工具箱 · 查找模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.0.1
-// @description  跨 iframe 文本检索高亮。依赖内核 wtb-core。
+// @version      1.0.2
+// @description  跨 iframe 文本检索高亮；拾取式抓取，抓取时以元素祖先链上最近的 div 为根节点，纳入根节点内全部文本。依赖内核 wtb-core。
 // @author       you
 // @match        *://*/*
 // @grant        unsafeWindow
@@ -22,7 +22,8 @@
 
     const MSG_TAG = bus.const.MSG_TAG;
     const UI_ATTR = bus.const.UI_ATTR;
-    const { h } = bus;
+    const HL_Z    = bus.const.HL_Z;
+    const { h, esc, isOwnUI } = bus;
 
     let IS_TOP = false;
     try { IS_TOP = (window.top === window); } catch (e) { IS_TOP = false; }
@@ -45,6 +46,19 @@
     let localContainers = [];
     let localMarks = [];
     let localCurrentIndex = -1;
+
+    /* 抓取注册表：uid -> { el: 根节点, label }（本 frame 内） */
+    const localGrabbed = new Map();
+
+    /* ============ 0. 容器稳定 ID ============ */
+    const uidMap = new WeakMap();
+    let uidSeq = 0;
+    function uidOf(el) {
+      if (!el) return 'all-links';
+      let u = uidMap.get(el);
+      if (!u) { u = 'u' + (++uidSeq); uidMap.set(el, u); }
+      return u;
+    }
 
     /* ============ 1. 样式 ============ */
     function injectStyle() {
@@ -95,7 +109,7 @@
       document.querySelectorAll(STRUCT_SEL).forEach(el => {
         if (!(el.textContent || '').trim()) return;
         if (el.parentElement && el.parentElement.closest(STRUCT_SEL)) return;
-        result.push({ el, kind: 'struct' });
+        result.push({ el, kind: 'struct', uid: uidOf(el) });
       });
 
       const divSet = new Set();
@@ -113,7 +127,7 @@
         const n = d.querySelectorAll('a').length;
         const children = d.querySelectorAll(':scope > div, :scope > section, :scope > nav, :scope > article, :scope > main, :scope > aside');
         for (const c of children) if (c.querySelectorAll('a').length === n) return;
-        divCandidates.push({ el: d, kind: 'div-links' });
+        divCandidates.push({ el: d, kind: 'div-links', uid: uidOf(d) });
       });
       divCandidates.sort(byDocOrder);
       divCandidates.forEach(c => result.push(c));
@@ -135,13 +149,13 @@
         if (divSet.has(el)) return;
         const txt = (el.textContent || '').trim();
         if (!txt || txt.length > MAX_DIV_TEXT) return;
-        textBlocks.push({ el, kind: 'text-block' });
+        textBlocks.push({ el, kind: 'text-block', uid: uidOf(el) });
       });
       textBlocks.sort(byDocOrder);
       textBlocks.forEach(c => result.push(c));
 
       if (document.querySelectorAll('a').length) {
-        result.push({ el: null, kind: 'all-links' });
+        result.push({ el: null, kind: 'all-links', uid: 'all-links' });
       }
       return result;
     }
@@ -279,7 +293,183 @@
       return localCurrentIndex;
     }
 
-    /* ============ 4. 跨 frame 通讯 ============ */
+    /* ============ 4. 抓取模式（拾取式） ============ */
+    const GRAB_EVENTS = ['mousedown','mouseup','click','dblclick','pointerdown','pointerup','contextmenu'];
+    let grabEnabled = false;
+    let grabAttached = false;
+    let hlBox = null, hlTip = null;
+
+    function ensureHighlightLayer() {
+      if (hlBox && hlBox.isConnected) return;
+      hlBox = document.createElement('div');
+      hlBox.setAttribute(UI_ATTR, '1');
+      hlBox.style.cssText = [
+        'position:fixed','left:0','top:0','width:0','height:0',
+        'z-index:' + HL_Z,'pointer-events:none','display:none',
+        'border:2px solid #2b6cff','background:rgba(43,108,255,.16)',
+        'border-radius:3px','box-sizing:border-box',
+        'box-shadow:0 0 0 1px rgba(255,255,255,.55) inset'
+      ].join(';');
+      (document.body || document.documentElement).appendChild(hlBox);
+    }
+    function ensureTipLayer() {
+      if (hlTip && hlTip.isConnected) return;
+      hlTip = document.createElement('div');
+      hlTip.setAttribute(UI_ATTR, '1');
+      hlTip.style.cssText = [
+        'position:fixed','left:0','top:0',
+        'z-index:' + (HL_Z + 1),'pointer-events:none','display:none',
+        'background:#1e2229','color:#7fd3ff',
+        'font:12px/1.5 Consolas,Monaco,"Courier New",monospace',
+        'padding:3px 8px','border-radius:4px','border:1px solid #2b6cff',
+        'max-width:60vw','white-space:nowrap','overflow:hidden','text-overflow:ellipsis',
+        'box-shadow:0 3px 12px rgba(0,0,0,.4)'
+      ].join(';');
+      (document.body || document.documentElement).appendChild(hlTip);
+    }
+    function describeEl(el) {
+      let s = el.tagName.toLowerCase();
+      if (el.id) s += '#' + el.id;
+      if (el.classList && el.classList.length) {
+        const c = [];
+        for (let i = 0; i < el.classList.length && c.length < 3; i++) c.push(el.classList[i]);
+        if (c.length) s += '.' + c.join('.');
+      }
+      return s;
+    }
+    function buildGrabLabel(el) {
+      let s = describeEl(el);
+      let txt = '';
+      try { txt = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 24); } catch (e) {}
+      if (txt) s += ' · ' + txt;
+      return s;
+    }
+
+    /**
+     * 计算抓取根节点：
+     *   从元素自身向上找第一个 div 祖先（不包含 body/html）。
+     *   - 若找到 → 该 div 为根
+     *   - 若找不到 → 退回元素自身
+     * 注意：如果元素本身就是 div，则取它更上一层的 div（"上一层div"）。
+     */
+    function computeGrabRoot(el) {
+      if (!el || el.nodeType !== 1) return el;
+      let p = el.parentElement;
+      while (p && p !== document.body && p !== document.documentElement) {
+        if (p.tagName === 'DIV') return p;
+        p = p.parentElement;
+      }
+      return el;
+    }
+
+    function showHighlight(el, ev) {
+      ensureHighlightLayer(); ensureTipLayer();
+      let r; try { r = el.getBoundingClientRect(); } catch (e) { return; }
+      hlBox.style.display = 'block';
+      hlBox.style.left   = r.left + 'px';
+      hlBox.style.top    = r.top + 'px';
+      hlBox.style.width  = r.width + 'px';
+      hlBox.style.height = r.height + 'px';
+      hlTip.textContent = '↖ ' + buildGrabLabel(el);
+      hlTip.style.display = 'block';
+      const cx = ev && typeof ev.clientX === 'number' ? ev.clientX : 0;
+      const cy = ev && typeof ev.clientY === 'number' ? ev.clientY : 0;
+      hlTip.style.left = Math.min(cx + 14, window.innerWidth - 12) + 'px';
+      hlTip.style.top  = Math.min(cy + 18, window.innerHeight - 12) + 'px';
+    }
+    function hideHighlight() {
+      if (hlBox) hlBox.style.display = 'none';
+      if (hlTip) hlTip.style.display = 'none';
+    }
+
+    function stopEvt(e) {
+      try { e.preventDefault(); } catch (err) {}
+      try { e.stopPropagation(); } catch (err) {}
+      try { if (e.stopImmediatePropagation) e.stopImmediatePropagation(); } catch (err) {}
+    }
+
+    function onGrabMouseMove(e) {
+      if (!grabEnabled) return;
+      const el = e.target;
+      if (!el || el.nodeType !== 1 || isOwnUI(el)) { hideHighlight(); return; }
+      // 直接高亮最终的"根节点"，所见即所得
+      const root = computeGrabRoot(el);
+      showHighlight(root, e);
+    }
+
+    function onGrabBlock(e) {
+      if (!grabEnabled) return;
+      const el = e.target;
+      if (!el || el.nodeType !== 1 || isOwnUI(el)) return;
+      stopEvt(e);
+      if (e.type === 'click') doGrabPick(el, e);
+    }
+
+    function onGrabKeyDown(e) {
+      if (!grabEnabled) return;
+      if (e.key !== 'Escape') return;
+      if (IS_TOP) setGrabEnabled(false);
+      else {
+        try { window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-escape' }, '*'); } catch (err) {}
+        setGrabEnabled(false, true);
+      }
+    }
+
+    function attachGrab() {
+      if (grabAttached) return;
+      grabAttached = true;
+      document.addEventListener('mousemove', onGrabMouseMove, true);
+      for (const ev of GRAB_EVENTS) document.addEventListener(ev, onGrabBlock, true);
+      window.addEventListener('keydown', onGrabKeyDown, true);
+    }
+    function detachGrab() {
+      if (!grabAttached) return;
+      grabAttached = false;
+      document.removeEventListener('mousemove', onGrabMouseMove, true);
+      for (const ev of GRAB_EVENTS) document.removeEventListener(ev, onGrabBlock, true);
+      window.removeEventListener('keydown', onGrabKeyDown, true);
+      hideHighlight();
+    }
+
+    function doGrabPick(el, ev) {
+      const root = computeGrabRoot(el);
+      const uid = uidOf(root);
+      const label = buildGrabLabel(root);
+      localGrabbed.set(uid, { el: root, label: label });
+
+      // 拾取式反馈：单击后立即显示根节点高亮
+      showHighlight(root, ev);
+
+      const payload = {
+        frameId: FRAME_ID,
+        frameLabel: getFrameLabel(),
+        uid: uid,
+        kind: 'grabbed',
+        label: label
+      };
+      if (IS_TOP) handleGrabbed(payload);
+      else {
+        try { window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-add', payload: payload }, '*'); }
+        catch (e) {}
+      }
+      // 抓取完成后自动退出抓取模式（与拾取一致）
+      setGrabEnabled(false);
+    }
+
+    function setGrabEnabled(v, fromParent) {
+      grabEnabled = !!v;
+      if (grabEnabled) attachGrab();
+      else { detachGrab(); hideHighlight(); }
+      if (IS_TOP && grabBtn) {
+        grabBtn.classList.toggle('wtb-grab-on', grabEnabled);
+        grabBtn.textContent = grabEnabled ? '📌 抓取中… (Esc 退出)' : '📌 抓取控件';
+      }
+      if (!fromParent) {
+        broadcastToChildren({ [MSG_TAG]: true, type: 'find/grab-toggle', enabled: grabEnabled });
+      }
+    }
+
+    /* ============ 5. 跨 frame 通讯 ============ */
     function getFrameLabel() {
       try {
         if (IS_TOP) return '顶层窗口';
@@ -299,8 +489,8 @@
       }
     }
 
-    /* ============ 5. 消息处理 ============ */
-    let allContainers = [];   // 仅顶层用
+    /* ============ 6. 消息与状态 ============ */
+    let allContainers = [];
     let activeEntry = null;
     let activeCount = 0;
     let activeIndex = -1;
@@ -309,17 +499,57 @@
     let filterKeyword = '';
 
     const KIND_LABELS = {
-      struct: '表格 列表', 'div-links': '链接容器 div',
-      'text-block': '文本 div', 'all-links': '其他 a 标签'
+      grabbed: '已抓取根节点',
+      struct: '表格 列表',
+      'div-links': '链接容器 div',
+      'text-block': '文本 div',
+      'all-links': '其他 a 标签'
     };
     const KIND_SHOW = {
-      struct: '表格 / 列表', 'div-links': '链接容器 div',
-      'text-block': '文本 div', 'all-links': '其他'
+      grabbed: '已抓取根',
+      struct: '表格 / 列表',
+      'div-links': '链接容器 div',
+      'text-block': '文本 div',
+      'all-links': '其他'
     };
 
-    /* -------- 顶层 UI 引用 -------- */
     let selEl = null, inputEl = null, filterEl = null,
-        prevBtn = null, nextBtn = null, statusEl = null, onlyAEl = null;
+        prevBtn = null, nextBtn = null, statusEl = null, onlyAEl = null,
+        grabBtn = null;
+
+    /* 顶层持有的单一抓取项 */
+    let grabbedEntry = null;
+
+    function isGrabbed(entry) {
+      return !!(grabbedEntry && entry &&
+        entry.frameId === grabbedEntry.frameId && entry.uid === grabbedEntry.uid);
+    }
+    function grabActive() { return !!grabbedEntry; }
+
+    function handleGrabbed(payload) {
+      if (!payload || !payload.uid) return;
+      grabbedEntry = {
+        frameId: payload.frameId,
+        frameLabel: payload.frameLabel,
+        uid: payload.uid,
+        kind: payload.kind || 'grabbed',
+        label: payload.label
+      };
+      let entry = allContainers.find(c =>
+        c.frameId === grabbedEntry.frameId && c.uid === grabbedEntry.uid);
+      if (!entry) {
+        entry = {
+          frameId: grabbedEntry.frameId,
+          frameLabel: grabbedEntry.frameLabel,
+          uid: grabbedEntry.uid,
+          kind: grabbedEntry.kind,
+          label: grabbedEntry.label
+        };
+        allContainers.push(entry);
+      }
+      activeEntry = entry;
+      refreshSelectionAndSearch();
+    }
 
     function updateStatus() {
       if (!statusEl) return;
@@ -327,19 +557,22 @@
         statusEl.textContent = '未找到可检索控件（表格 / 列表 / 链接 div / 文本 div）';
         return;
       }
+      const scope = grabActive()
+        ? ' ｜ 范围：' + esc(grabbedEntry.label || '(已抓取)')
+        : '';
       if (!activeEntry) {
-        statusEl.textContent = '请先在下拉框中选择一个容器';
+        statusEl.innerHTML = '请先在下拉框中选择一个容器' + scope;
         return;
       }
       const q = inputEl ? inputEl.value.trim() : '';
-      if (!q) { statusEl.textContent = '输入文本开始检索'; return; }
-      if (!activeCount) { statusEl.textContent = '未找到匹配项'; return; }
+      if (!q) { statusEl.innerHTML = '输入文本开始检索' + scope; return; }
+      if (!activeCount) { statusEl.innerHTML = '未找到匹配项' + scope; return; }
       statusEl.innerHTML = '匹配 <b>' + activeCount + '</b> 项 ｜ 当前第 <b>' + (activeIndex + 1) + '</b> 项' +
-        ' ｜ 来源：' + activeEntry.frameLabel;
+        ' ｜ 来源：' + activeEntry.frameLabel + scope;
     }
 
     function buildSelect() {
-      if (!selEl) return;
+      if (!selEl) return { changed: false };
       selEl.innerHTML = '';
       if (!allContainers.length) {
         const o = document.createElement('option');
@@ -347,24 +580,30 @@
         selEl.appendChild(o);
         selEl.disabled = true;
         activeEntry = null;
-        return;
+        return { changed: true };
       }
       selEl.disabled = false;
 
-      const kw = filterKeyword.trim().toLowerCase();
       let filtered = allContainers;
+      if (grabActive()) filtered = filtered.filter(isGrabbed);
+
+      const kw = filterKeyword.trim().toLowerCase();
       if (kw) {
-        filtered = allContainers.filter(c => {
+        filtered = filtered.filter(c => {
           const haystack = (c.label + ' ' + (c.frameLabel || '') + ' ' + (KIND_LABELS[c.kind] || '')).toLowerCase();
           return haystack.indexOf(kw) > -1;
         });
       }
+
       if (!filtered.length) {
         const o = document.createElement('option');
-        o.textContent = '没有匹配「' + filterKeyword + '」的选项';
+        if (grabActive() && !kw) o.textContent = '已抓取的控件暂不可用';
+        else o.textContent = '没有匹配「' + (filterKeyword || '') + '」的选项';
         selEl.appendChild(o);
         selEl.disabled = true;
-        return;
+        const prev = activeEntry;
+        activeEntry = null;
+        return { changed: prev !== null };
       }
 
       const byFrame = new Map();
@@ -378,11 +617,15 @@
         return 0;
       });
 
+      const KIND_ORDER = ['grabbed', 'struct', 'div-links', 'text-block', 'all-links'];
       for (const fid of frameIds) {
         const group = byFrame.get(fid);
-        const kindGroups = { struct: [], 'div-links': [], 'text-block': [], 'all-links': [] };
-        for (const item of group.items) (kindGroups[item.kind] || kindGroups.struct).push(item);
-        for (const kind of ['struct','div-links','text-block','all-links']) {
+        const kindGroups = { grabbed: [], struct: [], 'div-links': [], 'text-block': [], 'all-links': [] };
+        for (const item of group.items) {
+          const bucket = kindGroups[item.kind] || kindGroups.struct;
+          bucket.push(item);
+        }
+        for (const kind of KIND_ORDER) {
           const list = kindGroups[kind];
           if (!list.length) continue;
           const og = document.createElement('optgroup');
@@ -390,8 +633,8 @@
           og.label = '[' + short + '] ' + KIND_SHOW[kind] + ' (' + list.length + ')';
           for (const item of list) {
             const o = document.createElement('option');
-            o.value = item.frameId + '#' + item.idx;
-            o.textContent = item.label;
+            o.value = item.frameId + '#' + item.uid;
+            o.textContent = (grabActive() ? '📌 ' : '') + item.label;
             og.appendChild(o);
           }
           selEl.appendChild(og);
@@ -400,7 +643,7 @@
 
       let pickValue = null;
       if (activeEntry) {
-        const v = activeEntry.frameId + '#' + activeEntry.idx;
+        const v = activeEntry.frameId + '#' + activeEntry.uid;
         for (const opt of selEl.querySelectorAll('option')) if (opt.value === v) { pickValue = v; break; }
       }
       if (!pickValue) {
@@ -410,10 +653,24 @@
       const prevEntry = activeEntry;
       if (pickValue) {
         selEl.value = pickValue;
-        const [fid, idx] = pickValue.split('#');
-        activeEntry = allContainers.find(c => c.frameId === fid && c.idx === Number(idx)) || null;
+        const sep = pickValue.indexOf('#');
+        const fid = pickValue.slice(0, sep);
+        const uid = pickValue.slice(sep + 1);
+        activeEntry = allContainers.find(c => c.frameId === fid && c.uid === uid) || null;
+      } else {
+        activeEntry = null;
       }
       return { changed: prevEntry !== activeEntry };
+    }
+
+    function findLocalContainerByUid(uid) {
+      if (!uid) return null;
+      const g = localGrabbed.get(uid);
+      if (g) return { el: g.el, kind: 'grabbed', uid, label: g.label };
+      for (let i = 0; i < localContainers.length; i++) {
+        if (localContainers[i].uid === uid) return localContainers[i];
+      }
+      return null;
     }
 
     function resetAllFramesHighlight() {
@@ -428,7 +685,7 @@
       if (!activeEntry || !query) { updateStatus(); return; }
 
       if (activeEntry.frameId === FRAME_ID) {
-        const c = localContainers[activeEntry.idx];
+        const c = findLocalContainerByUid(activeEntry.uid);
         const count = runSearchLocal(c, query);
         activeCount = count > 0 ? count : 0;
         activeIndex = localCurrentIndex;
@@ -437,7 +694,7 @@
         broadcastToChildren({
           [MSG_TAG]: true, type: 'find/run',
           frameId: activeEntry.frameId,
-          containerIdx: activeEntry.idx,
+          containerUid: activeEntry.uid,
           query: query
         });
         updateStatus();
@@ -460,14 +717,46 @@
       }
     }
 
+    function refreshSelectionAndSearch() {
+      const r = buildSelect();
+      const q = inputEl ? inputEl.value.trim() : '';
+      if (r && r.changed && activeEntry) {
+        if (q) doSearch(q);
+        else { resetAllFramesHighlight(); updateStatus(); }
+      } else {
+        updateStatus();
+      }
+    }
+
     function rescan() {
       localContainers = scanContainers();
       allContainers = localContainers.map((c, i) => ({
         frameId: FRAME_ID,
         frameLabel: getFrameLabel(),
-        idx: i, kind: c.kind, label: labelFor(c, i)
+        idx: i, uid: c.uid, kind: c.kind, label: labelFor(c, i)
       }));
+      if (grabbedEntry) {
+        const found = allContainers.find(c =>
+          c.frameId === grabbedEntry.frameId && c.uid === grabbedEntry.uid);
+        if (!found) {
+          allContainers.push({
+            frameId: grabbedEntry.frameId,
+            frameLabel: grabbedEntry.frameLabel,
+            uid: grabbedEntry.uid,
+            kind: grabbedEntry.kind,
+            label: grabbedEntry.label
+          });
+        }
+        activeEntry = allContainers.find(c =>
+          c.frameId === grabbedEntry.frameId && c.uid === grabbedEntry.uid) || activeEntry;
+      }
+
       broadcastToChildren({ [MSG_TAG]: true, type: 'find/scan' });
+
+      if (grabEnabled) {
+        broadcastToChildren({ [MSG_TAG]: true, type: 'find/grab-toggle', enabled: true });
+      }
+
       clearTimeout(scanTimer);
       scanTimer = setTimeout(() => {
         buildSelect();
@@ -480,7 +769,8 @@
     function handleMessage(d) {
       if (!IS_TOP) {
         if (d.type === 'find/scan' || d.type === 'find/clear' ||
-            d.type === 'find/run'  || d.type === 'find/goto') {
+            d.type === 'find/run'  || d.type === 'find/goto' ||
+            d.type === 'find/grab-toggle') {
           broadcastToChildren(d);
         }
       }
@@ -493,7 +783,7 @@
             [MSG_TAG]: true, type: 'find/scan-result',
             frameId: FRAME_ID,
             frameLabel: getFrameLabel(),
-            containers: list.map((c, i) => ({ idx: i, kind: c.kind, label: labelFor(c, i) }))
+            containers: list.map((c, i) => ({ idx: i, uid: c.uid, kind: c.kind, label: labelFor(c, i) }))
           });
         }
         return;
@@ -501,8 +791,14 @@
 
       if (d.type === 'find/clear') { clearMarks(); return; }
 
+      if (d.type === 'find/grab-toggle') {
+        setGrabEnabled(d.enabled, true);
+        return;
+      }
+
       if (d.type === 'find/run' && d.frameId === FRAME_ID) {
-        const c = localContainers[d.containerIdx];
+        let c = d.containerUid ? findLocalContainerByUid(d.containerUid) : null;
+        if (!c && typeof d.containerIdx === 'number') c = localContainers[d.containerIdx];
         if (!c) return;
         const count = runSearchLocal(c, d.query);
         toTop({
@@ -530,7 +826,7 @@
           for (const c of d.containers) {
             allContainers.push({
               frameId: d.frameId, frameLabel: d.frameLabel,
-              idx: c.idx, kind: c.kind, label: c.label
+              idx: c.idx, uid: c.uid, kind: c.kind, label: c.label
             });
           }
         } else if (d.type === 'find/run-result' || d.type === 'find/goto-result') {
@@ -539,6 +835,8 @@
             activeIndex = d.currentIndex;
             updateStatus();
           }
+        } else if (d.type === 'find/grab-add') {
+          handleGrabbed(d.payload);
         }
       }
     }
@@ -547,19 +845,50 @@
       const d = e.data;
       if (!d || typeof d !== 'object' || d[MSG_TAG] !== true) return;
       if (typeof d.type !== 'string' || d.type.indexOf('find/') !== 0) return;
+
+      if (d.type === 'find/grab-state-request' && IS_TOP) {
+        try {
+          if (e.source) {
+            e.source.postMessage({
+              [MSG_TAG]: true,
+              type: 'find/grab-toggle',
+              enabled: grabEnabled
+            }, '*');
+          }
+        } catch (err) {}
+        return;
+      }
+
+      if (d.type === 'find/grab-escape' && IS_TOP) {
+        setGrabEnabled(false);
+        return;
+      }
+
       handleMessage(d);
     }, false);
 
-    /* ============ 6. 初始化（所有 frame） ============ */
+    /* ============ 7. 初始化（所有 frame） ============ */
     injectStyle();
     localContainers = scanContainers();
 
-    /* ============ 7. 顶层 UI 模块 ============ */
+    if (!IS_TOP) {
+      try {
+        window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-state-request' }, '*');
+      } catch (e) {}
+    }
+
+    /* ============ 8. 顶层 UI 模块 ============ */
     if (!IS_TOP) return;
 
     const MODULE_CSS = `
       .wtb-find-status { font-size: 12px; color: #9aa6bb; margin-top: 8px; word-break: break-all; }
       .wtb-find-status b { color: #ffd166; font-weight: 600; }
+      .wtb-find-grab.wtb-grab-on {
+        background: #4ea1ff !important;
+        border-color: #4ea1ff !important;
+        color: #04121f !important;
+        font-weight: 600;
+      }
     `;
 
     bus.registerModule({
@@ -591,8 +920,15 @@
         nextBtn.style.flex = '1';
         const row4 = h('div', { class: 'wtb-row' }, [prevBtn, nextBtn]);
 
+        grabBtn = h('button', {
+          class: 'wtb-btn ghost wtb-find-grab',
+          title: '单击页面元素，将以该元素上一层 div 为根节点，根节点内全部文本纳入检索范围'
+        }, '📌 抓取控件');
+        grabBtn.style.flex = '1';
+        const row5 = h('div', { class: 'wtb-row' }, [grabBtn]);
+
         onlyAEl = h('input', { type: 'checkbox', checked: true });
-        const row5 = h('div', { class: 'wtb-row' }, [
+        const row6 = h('div', { class: 'wtb-row' }, [
           h('label', { class: 'wtb-switch', title: '仅对“链接容器 div”这一类别生效' }, [
             onlyAEl, h('span', { class: 'track' }),
             h('span', {}, '链接容器 div 仅检索链接文本')
@@ -606,6 +942,7 @@
         pane.appendChild(row3);
         pane.appendChild(row4);
         pane.appendChild(row5);
+        pane.appendChild(row6);
         pane.appendChild(statusEl);
 
         const syncClearBtn = () => { clearBtn.disabled = !inputEl.value; };
@@ -634,8 +971,11 @@
         });
 
         selEl.addEventListener('change', () => {
-          const [fid, idx] = selEl.value.split('#');
-          activeEntry = allContainers.find(c => c.frameId === fid && c.idx === Number(idx)) || null;
+          const sep = selEl.value.indexOf('#');
+          if (sep < 0) { activeEntry = null; return; }
+          const fid = selEl.value.slice(0, sep);
+          const uid = selEl.value.slice(sep + 1);
+          activeEntry = allContainers.find(c => c.frameId === fid && c.uid === uid) || null;
           activeCount = 0; activeIndex = -1;
           const q = inputEl.value.trim();
           if (q) doSearch(q);
@@ -684,12 +1024,19 @@
           else { resetAllFramesHighlight(); updateStatus(); }
         });
 
+        /* 抓取按钮：进入/退出抓取模式 */
+        grabBtn.addEventListener('click', () => {
+          setGrabEnabled(!grabEnabled);
+          updateStatus();
+        });
+
         rescan();
         setTimeout(() => { if (!allContainers.length) rescan(); }, 1500);
       },
       unmount() {
         clearTimeout(searchTimer);
         clearTimeout(scanTimer);
+        if (IS_TOP) setGrabEnabled(false);
         resetAllFramesHighlight();
       }
     });
@@ -700,7 +1047,9 @@
       search: q => doSearch(q),
       next: () => doGoto(1),
       prev: () => doGoto(-1),
-      clear: () => { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); }
+      clear: () => { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); },
+      grabMode: on => setGrabEnabled(!!on),
+      hasGrab: () => !!grabbedEntry
     };
   }
 
