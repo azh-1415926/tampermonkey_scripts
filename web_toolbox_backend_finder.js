@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页工具箱 · 查找模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.0.2
+// @version      1.0.3
 // @description  跨 iframe 文本检索高亮；拾取式抓取，抓取时以元素祖先链上最近的 div 为根节点，纳入根节点内全部文本。依赖内核 wtb-core。
 // @author       you
 // @match        *://*/*
@@ -437,9 +437,6 @@
       const label = buildGrabLabel(root);
       localGrabbed.set(uid, { el: root, label: label });
 
-      // 拾取式反馈：单击后立即显示根节点高亮
-      showHighlight(root, ev);
-
       const payload = {
         frameId: FRAME_ID,
         frameLabel: getFrameLabel(),
@@ -447,13 +444,27 @@
         kind: 'grabbed',
         label: label
       };
+
       if (IS_TOP) handleGrabbed(payload);
       else {
         try { window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-add', payload: payload }, '*'); }
         catch (e) {}
       }
-      // 抓取完成后自动退出抓取模式（与拾取一致）
-      setGrabEnabled(false);
+
+      // 拾取式反馈：短暂显示根节点高亮，让用户确认抓到了谁
+      showHighlight(root, ev);
+      setTimeout(() => { if (!grabEnabled) hideHighlight(); }, 700);
+
+      // ★ 抓取完成后自动退出抓取模式（本地 + 顶层联动）
+      if (IS_TOP) {
+        setGrabEnabled(false);
+      } else {
+        // 子框架本地立即退出，不再拦截后续鼠标事件
+        setGrabEnabled(false, true);
+        // 通知顶层也退出抓取模式（顶层会再广播给其他 iframe）
+        try { window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-escape' }, '*'); }
+        catch (e) {}
+      }
     }
 
     function setGrabEnabled(v, fromParent) {
@@ -515,7 +526,7 @@
 
     let selEl = null, inputEl = null, filterEl = null,
         prevBtn = null, nextBtn = null, statusEl = null, onlyAEl = null,
-        grabBtn = null;
+        grabBtn = null, cancelGrabBtn = null, refreshBtn = null;
 
     /* 顶层持有的单一抓取项 */
     let grabbedEntry = null;
@@ -551,7 +562,25 @@
       refreshSelectionAndSearch();
     }
 
+    /**
+     * ★ 取消本次抓取：
+     *   清空顶层抓取项 + 通知所有 frame 清空各自的 localGrabbed，
+     *   然后重新索引全部控件（重新扫描所有 iframe）。
+     */
+    function cancelGrab() {
+      grabbedEntry = null;
+      localGrabbed.clear();
+      broadcastToChildren({ [MSG_TAG]: true, type: 'find/grab-clear' });
+      activeEntry = null;
+      activeCount = 0;
+      activeIndex = -1;
+      resetAllFramesHighlight();
+      rescan();
+      updateStatus();
+    }
+
     function updateStatus() {
+      if (cancelGrabBtn) cancelGrabBtn.disabled = !grabbedEntry;
       if (!statusEl) return;
       if (!allContainers.length) {
         statusEl.textContent = '未找到可检索控件（表格 / 列表 / 链接 div / 文本 div）';
@@ -728,6 +757,16 @@
       }
     }
 
+    /** ★ 用当前输入框内容重新执行一次检索（刷新高亮） */
+    function refreshSearch() {
+      clearTimeout(searchTimer);
+      const q = inputEl ? inputEl.value.trim() : '';
+      if (!q) { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); return; }
+      if (!activeEntry && allContainers.length) buildSelect();
+      if (!activeEntry) { updateStatus(); return; }
+      doSearch(q);
+    }
+
     function rescan() {
       localContainers = scanContainers();
       allContainers = localContainers.map((c, i) => ({
@@ -770,7 +809,7 @@
       if (!IS_TOP) {
         if (d.type === 'find/scan' || d.type === 'find/clear' ||
             d.type === 'find/run'  || d.type === 'find/goto' ||
-            d.type === 'find/grab-toggle') {
+            d.type === 'find/grab-toggle' || d.type === 'find/grab-clear') {
           broadcastToChildren(d);
         }
       }
@@ -790,6 +829,12 @@
       }
 
       if (d.type === 'find/clear') { clearMarks(); return; }
+
+      // ★ 清空本 frame 的抓取注册表
+      if (d.type === 'find/grab-clear') {
+        localGrabbed.clear();
+        return;
+      }
 
       if (d.type === 'find/grab-toggle') {
         setGrabEnabled(d.enabled, true);
@@ -889,6 +934,7 @@
         color: #04121f !important;
         font-weight: 600;
       }
+      .wtb-btn[disabled] { opacity: .45; cursor: not-allowed; }
     `;
 
     bus.registerModule({
@@ -911,8 +957,10 @@
 
         inputEl = h('input', { type: 'text', placeholder: '输入要检索的文本，回车切换下一项' });
         inputEl.style.flex = '1';
+        // ★ 第二个输入框的刷新按钮：用当前关键词重新高亮，无需重新输入
+        refreshBtn = h('button', { class: 'wtb-btn ghost', title: '刷新高亮（用当前关键词重新检索一次）' }, '↻');
         const clearBtn = h('button', { class: 'wtb-btn ghost', title: '清空输入框' }, '✕');
-        const row3 = h('div', { class: 'wtb-row' }, [inputEl, clearBtn]);
+        const row3 = h('div', { class: 'wtb-row' }, [inputEl, refreshBtn, clearBtn]);
 
         prevBtn = h('button', { class: 'wtb-btn ghost' }, '↑ 上一个');
         prevBtn.style.flex = '1';
@@ -925,7 +973,13 @@
           title: '单击页面元素，将以该元素上一层 div 为根节点，根节点内全部文本纳入检索范围'
         }, '📌 抓取控件');
         grabBtn.style.flex = '1';
-        const row5 = h('div', { class: 'wtb-row' }, [grabBtn]);
+        // ★ 取消本次抓取 + 重新索引全部控件
+        cancelGrabBtn = h('button', {
+          class: 'wtb-btn ghost',
+          title: '取消本次抓取，并重新索引页面（含所有 iframe）的全部控件'
+        }, '✖ 取消抓取');
+        cancelGrabBtn.disabled = true;
+        const row5 = h('div', { class: 'wtb-row' }, [grabBtn, cancelGrabBtn]);
 
         onlyAEl = h('input', { type: 'checkbox', checked: true });
         const row6 = h('div', { class: 'wtb-row' }, [
@@ -1015,6 +1069,14 @@
           inputEl.focus();
         });
 
+        // ★ 刷新按钮：重新执行当前检索，刷新高亮标记
+        refreshBtn.addEventListener('click', () => {
+          refreshSearch();
+          refreshBtn.textContent = '✓';
+          clearTimeout(refreshBtn._t);
+          refreshBtn._t = setTimeout(() => { refreshBtn.textContent = '↻'; }, 700);
+        });
+
         prevBtn.addEventListener('click', () => doGoto(-1));
         nextBtn.addEventListener('click', () => doGoto(1));
         rescanBtn.addEventListener('click', rescan);
@@ -1028,6 +1090,11 @@
         grabBtn.addEventListener('click', () => {
           setGrabEnabled(!grabEnabled);
           updateStatus();
+        });
+
+        /* ★ 取消抓取按钮：清空抓取项 + 重新索引全部控件 */
+        cancelGrabBtn.addEventListener('click', () => {
+          cancelGrab();
         });
 
         rescan();
@@ -1048,7 +1115,9 @@
       next: () => doGoto(1),
       prev: () => doGoto(-1),
       clear: () => { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); },
+      refresh: () => refreshSearch(),
       grabMode: on => setGrabEnabled(!!on),
+      cancelGrab: () => cancelGrab(),
       hasGrab: () => !!grabbedEntry
     };
   }
