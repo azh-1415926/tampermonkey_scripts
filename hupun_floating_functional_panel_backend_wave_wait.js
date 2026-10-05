@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         悬浮功能面板 - 待分配执行端
 // @namespace    https://example.com/tm-panel
-// @version      1.0.0
-// @description  在"待分配" iframe 内运行，接收主控端 postMessage 并执行无单号 / 有单号 / 重置
+// @version      1.1.0
+// @description  在“待分配” iframe 内运行，向主面板上报 UI 配置并执行无单号 / 有单号 / 重置
 // @author       You
 // @match        https://wms-vt.hupun.com/wms/waveWait*
 // @match        https://wms-v.hupun.com/wms/waveWait*
@@ -15,8 +15,29 @@
 
     if (window.self === window.top) return;
 
-    const CHANNEL = 'tm_panel_exec';
+    const CHANNEL   = 'tm_panel_exec';
     const SELF_NAME = 'print_pick';
+
+    /* ============================================================
+     * 面板 UI 配置（由本执行端声明，主面板负责渲染）
+     * 与波次打单执行端共用“打单”分组标题 → 主面板会自动合并
+     * ============================================================ */
+    const PANEL_CONFIG = [
+        {
+            title: '打单',
+            open: false,
+            items: [
+                {
+                    label: '待分配',
+                    buttons: [
+                        { text: '无单号', fn: 'function_print_pick_empty_search' },
+                        { text: '有单号', fn: 'function_print_pick_not_empty_search' },
+                        { text: '重置',   fn: 'function_print_pick_reset' }
+                    ]
+                }
+            ]
+        }
+    ];
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -388,7 +409,9 @@
                     name: SELF_NAME,
                     url: location.href,
                     title: document.title,
-                    ts: Date.now()
+                    ts: Date.now(),
+                    /* ★ UI 配置交给主面板渲染 */
+                    panelConfig: PANEL_CONFIG
                 }
             }, '*');
         } catch (e) {}
