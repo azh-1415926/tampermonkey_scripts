@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         悬浮功能面板 - 波次打单执行端
 // @namespace    https://example.com/tm-panel
-// @version      1.0.0
-// @description  在"波次打单" iframe 内运行，接收主控端 postMessage 并按承运商 / 拣货区域执行波次（含每页500条设置，极速版）
+// @version      1.1.0
+// @description  在“波次打单” iframe 内运行，向主面板上报 UI 配置并按承运商 / 拣货区域执行波次（含每页500条设置，极速版）
 // @author       You
 // @match        https://wms-t.hupun.com/url.d*
 // @match        https://wms.hupun.com/url.d*
@@ -15,8 +15,35 @@
 
     if (window.self === window.top) return;
 
-    const CHANNEL = 'tm_panel_exec';
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('_id') !== '203') return;
+
+    const CHANNEL   = 'tm_panel_exec';
     const SELF_NAME = 'print_wave';
+
+    /* ============================================================
+     * 面板 UI 配置（由本执行端声明，主面板负责渲染）
+     * 与待分配执行端共用“打单”分组标题 → 主面板会自动合并
+     * ============================================================ */
+    const PANEL_CONFIG = [
+        {
+            title: '打单',
+            open: false,
+            items: [
+                {
+                    label: '波次打单',
+                    selects: [
+                        { key: 'carrier', label: '承运商',   options: ['中通','极兔','邮政','圆通'], value: '中通' },
+                        { key: 'area',    label: '拣货区域', options: ['A','B','C','D','E'],         value: 'E' }
+                    ],
+                    buttons: [
+                        { text: '查询', fn: 'function_wave_print',       params: ['carrier','area'] },
+                        { text: '清空', fn: 'function_wave_print_clear' }
+                    ]
+                }
+            ]
+        }
+    ];
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const $ = (sel) => { try { return document.querySelector(sel); } catch (e) { return null; } };
@@ -642,7 +669,14 @@
             window.parent.postMessage({
                 __tm_channel: CHANNEL,
                 type: 'READY',
-                info: { name: SELF_NAME, url: location.href, title: document.title, ts: Date.now() }
+                info: {
+                    name: SELF_NAME,
+                    url: location.href,
+                    title: document.title,
+                    ts: Date.now(),
+                    /* ★ UI 配置交给主面板渲染 */
+                    panelConfig: PANEL_CONFIG
+                }
             }, '*');
         } catch (e) {}
     }
