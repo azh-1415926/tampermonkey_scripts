@@ -2,7 +2,7 @@
 // @name         网页工具箱 · 万里牛面板模块
 // @namespace    https://github.com/yourname/web-toolbox
 // @version      2.1.0
-// @description  万里牛悬浮功能面板（移植为 WTB 模块）。主界面仅提供骨架与控件渲染，实际功能与控件配置由各执行端通过 READY.info.panelConfig 上报。
+// @description  万里牛悬浮功能面板（移植为 WTB 模块）。主界面仅提供骨架与通用控件渲染，实际功能与控件配置由各执行端通过 READY.info.panelConfig 上报。
 // @author       you
 // @match        *://*/*
 // @grant        unsafeWindow
@@ -35,7 +35,7 @@
 
         const CHANNEL        = 'tm_panel_exec';
         const CALL_TIMEOUT   = 30000;
-        const FRESH_WINDOW   = 10000;   /* 10s 内注册的视为“新连接” */
+        const FRESH_WINDOW   = 10000;   /* 10s 内注册的视为"新连接" */
         const PRUNE_INTERVAL = 2000;    /* 每 2s 巡检一次执行端连接 */
 
         const executors    = [];
@@ -64,7 +64,7 @@
 
         function registerExecutor(source, info) {
             if (!source) return;
-            const name = (info && info.name) || 'default';
+            const name        = (info && info.name) || 'default';
             const panelConfig = (info && Array.isArray(info.panelConfig)) ? info.panelConfig : null;
 
             const existing = executors.find(function (e) { return e.source === source; });
@@ -105,7 +105,9 @@
                 } else if (fe && !document.contains(fe)) {
                     return false;
                 }
-            } catch (e) { /* 跨域：仅依赖 closed */ }
+            } catch (e) {
+                /* 跨域访问 frameElement 会抛错，退化为仅依赖 closed */
+            }
 
             return true;
         }
@@ -122,6 +124,7 @@
             return changed;
         }
 
+        /* -------- 周期性巡检 -------- */
         function startPruneLoop() {
             if (pruneTimer) return;
             pruneTimer = setInterval(function () {
@@ -524,13 +527,14 @@
             const key    = g.title;
             const isOpen = groupOpenState.has(key) ? groupOpenState.get(key) : !!g.open;
 
-            const group = h('div', { class: 'wtb-hp-group' + (isOpen ? ' open' : '') });
+            const group  = h('div', { class: 'wtb-hp-group' + (isOpen ? ' open' : '') });
             const header = h('div', { class: 'wtb-hp-group-header' }, [
                 h('span', { class: 'wtb-hp-arrow' }, '▶'),
                 h('span', {}, g.title)
             ]);
             header.addEventListener('click', function () {
-                groupOpenState.set(key, group.classList.toggle('open'));
+                const nowOpen = group.classList.toggle('open');
+                groupOpenState.set(key, nowOpen);
             });
 
             const body = h('div', { class: 'wtb-hp-group-body' });
@@ -550,7 +554,7 @@
             /** key -> 控件元素。旧的单 input 用 __defaultInput 作为 key */
             const fieldEls = {};
 
-            /* -------- 旧式单输入（兼容） -------- */
+            /* -------- 旧式单输入（兼容原配置） -------- */
             if (itemCfg.input) {
                 const inputEl = h('input', {
                     type: 'text',
@@ -561,7 +565,7 @@
                 fieldEls.__defaultInput = inputEl;
             }
 
-            /* -------- 多单行输入 -------- */
+            /* -------- 新式多单行输入 -------- */
             if (Array.isArray(itemCfg.inputs) && itemCfg.inputs.length) {
                 itemCfg.inputs.forEach(function (ic) {
                     const wrap = h('div', { class: 'wtb-hp-input-row' });
@@ -624,6 +628,7 @@
                     let args = [];
                     if (Array.isArray(b.params) && b.params.length) {
                         if (b.asObject) {
+                            /* 命名参数：合并成一个对象 */
                             const obj = {};
                             b.params.forEach(function (k) {
                                 const el = fieldEls[k];
@@ -631,6 +636,7 @@
                             });
                             args = [obj];
                         } else {
+                            /* 位置参数 */
                             args = b.params.map(function (k) {
                                 const el = fieldEls[k];
                                 return el ? String(el.value).trim() : '';
@@ -719,7 +725,7 @@
                 ctxRef = null;
             },
             onActivate: function () {
-                pruneExecutors();
+                pruneExecutors();          /* 切回模块时立即刷新一次 */
                 refreshExecDetail();
                 renderPanels();
             }
@@ -765,7 +771,9 @@
             });
         });
 
+        /* 启动周期巡检（即使面板关闭也持续运行） */
         startPruneLoop();
+
         bus.log('[hupun] 模块注册完成');
     }
 
