@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页工具箱 · 悬浮窗主界面
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.1.0
+// @version      1.2.0
 // @description  工具箱外壳：浮动面板 + 模块注册中心 + 消息总线。功能由独立模块脚本提供。
 // @author       you
 // @match        *://*/*
@@ -292,11 +292,27 @@
     }
     .wtb-panel[hidden] { display: none !important; }
 
+    /* ★ 面板顶栏：可拖动的把手区域 */
     .wtb-panel-head {
       display: flex; align-items: center; justify-content: space-between;
       background: #262c36; border-bottom: 1px solid #333a45;
       flex: 0 0 auto;
+      cursor: move;                /* 提示这里能拖动 */
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;          /* 触屏拖动不滚页面 */
     }
+
+    /* ★ 拖动状态下的视觉反馈 */
+    .wtb-panel.dragging {
+      box-shadow: 0 22px 60px rgba(0,0,0,.6);
+    }
+    .wtb-panel.dragging,
+    .wtb-panel.dragging .wtb-panel-head { cursor: grabbing; }
+    .wtb-panel.dragging .wtb-tab,
+    .wtb-panel.dragging .wtb-gear,
+    .wtb-panel.dragging .wtb-close { pointer-events: none; }
+
     .wtb-tabs { display: flex; flex-wrap: wrap; }
     .wtb-tab {
       background: transparent; border: 0; color: #8b94a3;
@@ -508,6 +524,7 @@
   const CFG_KEY = 'wtb:core:config:v1';
   const cfg = {
     fab: null,
+    panel: null,                   // ★ 面板手动拖动后的像素坐标 { x, y }
     defaultTab: null,
     size: 'standard',
     fabSize: 'standard',
@@ -584,6 +601,13 @@
           y: Math.min(1, Math.max(0, Number(o.fab.y)))
         };
       }
+      // ★ 恢复面板手动位置
+      if (o.panel && isFinite(o.panel.x) && isFinite(o.panel.y)) {
+        cfg.panel = {
+          x: Math.round(Number(o.panel.x)),
+          y: Math.round(Number(o.panel.y))
+        };
+      }
       if (typeof o.defaultTab === 'string' && o.defaultTab) cfg.defaultTab = o.defaultTab;
       if (typeof o.size === 'string' && SIZE_PRESETS.some(p => p.id === o.size)) cfg.size = o.size;
       if (o.size === 'auto') cfg.size = 'standard';        // 兼容已废弃的 auto
@@ -624,6 +648,7 @@
     fabEl.addEventListener('click', onFabClick);
     bindFabDrag();
     bindFabContextMenu();
+    bindPanelDrag();                 // ★ 绑定面板拖动
 
     shadowRoot.querySelector('.wtb-close').addEventListener('click', closePanel);
     gearEl.addEventListener('click', toggleSettings);
@@ -941,7 +966,120 @@
   }
 
   /* ============================================================
-   * 3. 面板尺寸：预设 + 尺寸约束
+   * 3. ★ 面板拖动
+   * ============================================================ */
+
+  let suppressPanelClick = false;
+
+  /**
+   * 把面板移动到指定位置，并夹紧在视口内。
+   */
+  function movePanel(left, top) {
+    if (!panelEl || panelEl.hidden) return null;
+    const pw = panelEl.offsetWidth;
+    const ph = panelEl.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const maxLeft = Math.max(8, vw - pw - 8);
+    const maxTop  = Math.max(8, vh - ph - 8);
+    const l = clamp(left, 8, maxLeft);
+    const t = clamp(top,  8, maxTop);
+    panelEl.style.left   = l + 'px';
+    panelEl.style.top    = t + 'px';
+    panelEl.style.right  = 'auto';
+    panelEl.style.bottom = 'auto';
+    return { left: l, top: t };
+  }
+
+  /**
+   * 绑定面板顶栏的拖动。
+   * 采用「移动超过阈值才算拖动」的策略，保证顶栏内的 tab / 齿轮 /
+   * 关闭按钮的点击不会被误伤。
+   */
+  function bindPanelDrag() {
+    if (!panelEl) return;
+    const head = shadowRoot.querySelector('.wtb-panel-head');
+    if (!head) return;
+
+    let state = null;
+
+    function onMove(e) {
+      if (!state || e.pointerId !== state.id) return;
+      const dx = e.clientX - state.startX;
+      const dy = e.clientY - state.startY;
+
+      if (!state.moved) {
+        if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+        state.moved = true;
+        panelEl.classList.add('dragging');
+        try { head.setPointerCapture(e.pointerId); } catch (err) {}
+      }
+      if (e.cancelable) e.preventDefault();
+      movePanel(state.originLeft + dx, state.originTop + dy);
+    }
+
+    function onUp(e) {
+      if (!state || e.pointerId !== state.id) return;
+      const moved = state.moved;
+      try { head.releasePointerCapture(state.id); } catch (err) {}
+      state = null;
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('pointercancel', onUp, true);
+      panelEl.classList.remove('dragging');
+      if (!moved) return;
+
+      // 拦截拖动结束后的 click，避免误触顶栏按钮
+      suppressPanelClick = true;
+      setTimeout(() => { suppressPanelClick = false; }, 0);
+
+      const rect = panelEl.getBoundingClientRect();
+      cfg.panel = { x: Math.round(rect.left), y: Math.round(rect.top) };
+      saveCfg();
+      bus.emit('panel:moved', { panel: cfg.panel });
+    }
+
+    head.addEventListener('pointerdown', e => {
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      // 顶栏右侧的操作按钮不参与拖动
+      if (e.target.closest && e.target.closest('.wtb-gear, .wtb-close')) return;
+
+      const rect = panelEl.getBoundingClientRect();
+      state = {
+        id: e.pointerId,
+        startX: e.clientX, startY: e.clientY,
+        originLeft: rect.left, originTop: rect.top,
+        moved: false
+      };
+      // 用 window 上的捕获监听兜底，避免指针快速移出顶栏丢失事件
+      window.addEventListener('pointermove', onMove, true);
+      window.addEventListener('pointerup', onUp, true);
+      window.addEventListener('pointercancel', onUp, true);
+    });
+
+    // 拖动结束后吞掉 click
+    head.addEventListener('click', e => {
+      if (suppressPanelClick) {
+        suppressPanelClick = false;
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    }, true);
+  }
+
+  /**
+   * 复位面板位置（回到悬浮球旁边的自动布局）
+   */
+  function resetPanelPosition(silent) {
+    cfg.panel = null;
+    saveCfg();
+    if (panelEl && !panelEl.hidden) positionPanel();
+    bus.emit('panel:position-reset');
+    if (!silent) toast('面板位置已复位');
+  }
+
+  /* ============================================================
+   * 4. 面板尺寸 & 开合 & 定位
    * ============================================================ */
 
   function resolvePanelSize(id) {
@@ -1005,8 +1143,19 @@
     bus.emit('panel:close');
   }
 
+  /**
+   * ★ 面板定位：
+   * 1) 若存在用户手动拖动的坐标 cfg.panel，则直接沿用（并夹紧到视口内）；
+   * 2) 否则按原有逻辑：自动贴到悬浮球上方 / 下方。
+   */
   function positionPanel() {
     if (!panelEl || panelEl.hidden || !fabEl) return;
+
+    // 用户手动拖动过 → 保持其位置
+    if (cfg.panel) {
+      movePanel(cfg.panel.x, cfg.panel.y);
+      return;
+    }
 
     const GAP = 12;
     const fabR = fabEl.getBoundingClientRect();
@@ -1061,7 +1210,7 @@
   }
 
   /* ============================================================
-   * 4. 设置面板
+   * 5. 设置面板
    * ============================================================ */
 
   function buildSettingsPane() {
@@ -1151,9 +1300,12 @@
       bus.emit('settings:default-tab', cfg.defaultTab);
     });
 
-    /* ---- 悬浮球位置 ---- */
-    const resetFabBtn = h('button', { class: 'wtb-btn ghost' }, '复位到默认位置');
+    /* ---- 位置复位 ---- */
+    const resetFabBtn = h('button', { class: 'wtb-btn ghost' }, '复位悬浮球位置');
     resetFabBtn.addEventListener('click', () => resetFab());
+
+    const resetPanelBtn = h('button', { class: 'wtb-btn ghost' }, '复位面板位置');
+    resetPanelBtn.addEventListener('click', () => resetPanelPosition());
 
     const pane = h('div', { class: 'wtb-pane wtb-settings' }, [
       h('div', { class: 'wtb-sec' }, [
@@ -1185,9 +1337,9 @@
         h('div', { class: 'wtb-hint' }, '每次打开工具箱时自动切换到所选页面；未设置则跟随上次打开的页面。')
       ]),
       h('div', { class: 'wtb-sec' }, [
-        h('div', { class: 'wtb-sec-title' }, '悬浮球位置'),
-        h('div', { class: 'wtb-row' }, [resetFabBtn]),
-        h('div', { class: 'wtb-hint' }, '按住悬浮球拖动即可移动；在悬浮球上点右键可快速复位；窗口尺寸变化时按比例保持位置。')
+        h('div', { class: 'wtb-sec-title' }, '位置'),
+        h('div', { class: 'wtb-row' }, [resetFabBtn, resetPanelBtn]),
+        h('div', { class: 'wtb-hint' }, '按住悬浮球拖动即可移动；拖动面板顶栏可移动面板；在悬浮球上点右键可快速复位；窗口尺寸变化时按比例保持位置。')
       ])
     ]);
 
@@ -1358,6 +1510,17 @@
     return SIZE_PRESETS.map(p => ({ id: p.id, label: p.label, w: p.w, h: p.h }));
   };
 
+  /* ★ 面板位置 API */
+  bus.movePanel = function (left, top) {
+    const r = movePanel(left, top);
+    if (r) { cfg.panel = r; saveCfg(); }
+    return r;
+  };
+  bus.resetPanelPosition = function () { resetPanelPosition(); };
+  bus.getPanelPosition = function () {
+    return cfg.panel ? { x: cfg.panel.x, y: cfg.panel.y } : null;
+  };
+
   bus.setFabSize = function (id) { return setFabSize(id); };
   bus.getFabSize = function () { return cfg.fabSize; };
   bus.listFabSizes = function () {
@@ -1403,6 +1566,9 @@
       getDefaultTab: bus.getDefaultTab,
       setPanelSize: bus.setPanelSize,
       getPanelSize: bus.getPanelSize,
+      movePanel: bus.movePanel,
+      resetPanelPosition: bus.resetPanelPosition,
+      getPanelPosition: bus.getPanelPosition,
       setFabSize: bus.setFabSize,
       getFabSize: bus.getFabSize,
       setFabOpacity: bus.setFabOpacity,
