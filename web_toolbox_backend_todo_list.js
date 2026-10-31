@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页工具箱 · 任务清单模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.0.0
-// @description  多清单任务 / 注意事项管理，跨页面、跨标签页同步存储，支持复制清单、编辑创建时间。依赖内核 wtb-core，仅在顶层运行。
+// @version      1.1.0
+// @description  多清单任务 / 注意事项管理，跨页面、跨标签页同步存储，支持复制清单、编辑创建时间、导入导出备份。依赖内核 wtb-core，仅在顶层运行。
 // @author       you
 // @match        *://*/*
 // @grant        unsafeWindow
@@ -596,6 +596,128 @@
       toast('已清除 ' + n + ' 项已完成');
     }
 
+    /* ---------- 导出：下载 JSON 备份 ---------- */
+    function exportData() {
+      try {
+        const data = JSON.stringify(DB, null, 2);
+        const now = new Date();
+        const stamp = now.getFullYear() + pad2(now.getMonth() + 1) + pad2(now.getDate()) +
+          '-' + pad2(now.getHours()) + pad2(now.getMinutes());
+        const blob = new Blob([data], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'wtb-tasks-' + stamp + '.json';
+        a.style.display = 'none';
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        setTimeout(function () {
+          try { a.remove(); } catch (e) {}
+          try { URL.revokeObjectURL(url); } catch (e) {}
+        }, 1000);
+
+        const n = DB.lists.reduce((s, l) => s + l.tasks.length, 0);
+        toast('已导出 ' + DB.lists.length + ' 个清单 / ' + n + ' 项任务');
+      } catch (e) {
+        toast('导出失败：' + ((e && e.message) || e), true);
+      }
+    }
+
+    /* ---------- 导入：选择 JSON 文件 ---------- */
+    function importData() {
+      let picker;
+      try {
+        picker = document.createElement('input');
+        picker.type = 'file';
+        picker.accept = '.json,application/json,text/plain';
+        picker.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
+      } catch (e) {
+        toast('当前环境不支持文件选择', true);
+        return;
+      }
+
+      picker.addEventListener('change', function () {
+        const file = picker.files && picker.files[0];
+        try { picker.remove(); } catch (e) {}
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function () {
+          let raw = null;
+          try {
+            raw = JSON.parse(String(reader.result || ''));
+          } catch (e) {
+            toast('导入失败：不是合法的 JSON 文件', true);
+            return;
+          }
+          importFromJSON(raw);
+        };
+        reader.onerror = function () { toast('读取文件失败', true); };
+        try { reader.readAsText(file, 'utf-8'); }
+        catch (e) { toast('读取文件失败', true); }
+      });
+
+      (document.body || document.documentElement).appendChild(picker);
+      picker.click();
+    }
+
+    /* ---------- 导入：数据合并 / 覆盖 ---------- */
+    function importFromJSON(raw) {
+      if (!raw || !Array.isArray(raw.lists) || !raw.lists.length) {
+        toast('导入失败：文件中没有清单数据', true);
+        return;
+      }
+
+      const incoming = normalize({ v: 1, lists: raw.lists });
+      const totalTasks = incoming.lists.reduce((s, l) => s + l.tasks.length, 0);
+
+      const replace = ask(
+        '即将导入 ' + incoming.lists.length + ' 个清单 / ' + totalTasks + ' 项任务。\n\n' +
+        '「确定」= 覆盖现有全部数据\n' +
+        '「取消」= 合并到现有数据之后'
+      );
+
+      if (replace) {
+        DB = incoming;
+        save();
+        renderAll();
+        toast('已覆盖导入 ' + DB.lists.length + ' 个清单 / ' + totalTasks + ' 项任务');
+        return;
+      }
+
+      /* 合并模式：逐清单追加，重名自动加序号 */
+      const used = new Set(DB.lists.map(l => l.name));
+      let addedLists = 0;
+      let addedTasks = 0;
+
+      for (const l of incoming.lists) {
+        if (DB.lists.length >= MAX_LISTS) break;
+        let name = l.name;
+        let i = 1;
+        while (used.has(name)) { name = l.name + ' (' + (++i) + ')'; }
+        used.add(name);
+
+        const tasks = l.tasks.map(t => ({
+          id: uid(),
+          text: t.text,
+          done: t.done,
+          created: t.created,
+          doneAt: t.doneAt
+        }));
+
+        DB.lists.push({ id: uid(), name: name.slice(0, 40), tasks: tasks });
+        addedLists++;
+        addedTasks += tasks.length;
+      }
+
+      if (!addedLists) { toast('未导入：清单数量已达上限', true); return; }
+
+      DB.activeId = DB.lists[DB.lists.length - 1].id;
+      save();
+      renderAll();
+      toast('已合并 ' + addedLists + ' 个清单 / ' + addedTasks + ' 项任务');
+    }
+
     /* ---------- 跨页面同步 ---------- */
     function onRemoteChange() {
       const next = normalize(store.read());
@@ -754,7 +876,13 @@
         const delBtn = h('button', { class: 'wtb-tk-icon danger', type: 'button', title: '删除当前清单' }, '🗑');
         delBtn.addEventListener('click', deleteActiveList);
 
-        const bar = h('div', { class: 'wtb-tk-bar' }, [listsEl, newBtn, dupBtn, renBtn, delBtn]);
+        const expBtn = h('button', { class: 'wtb-tk-icon', type: 'button', title: '导出全部清单（下载 JSON 备份）' }, '📤');
+        expBtn.addEventListener('click', exportData);
+
+        const impBtn = h('button', { class: 'wtb-tk-icon', type: 'button', title: '导入清单（选择 JSON 文件，可覆盖或合并）' }, '📥');
+        impBtn.addEventListener('click', importData);
+
+        const bar = h('div', { class: 'wtb-tk-bar' }, [listsEl, newBtn, dupBtn, renBtn, delBtn, expBtn, impBtn]);
 
         /* --- 输入行 --- */
         inputEl = h('input', { class: 'wtb-tk-input', type: 'text', placeholder: '添加任务，回车确认' });
@@ -844,6 +972,38 @@
         const task = list.tasks.find(t => t.id === taskId);
         if (!task || !isFinite(ts)) return false;
         task.created = +ts;
+        save();
+        if (ctxRef) renderAll();
+        return true;
+      },
+      /** 导出（返回 JSON 字符串，便于其它模块调用） */
+      exportJSON: () => JSON.stringify(DB, null, 2),
+      /** 导入（raw 为已解析对象或 JSON 字符串，replace=true 覆盖） */
+      importJSON(raw, replace) {
+        let data = raw;
+        if (typeof data === 'string') {
+          try { data = JSON.parse(data); } catch (e) { return false; }
+        }
+        if (!data || !Array.isArray(data.lists) || !data.lists.length) return false;
+        if (replace) {
+          DB = normalize({ v: 1, lists: data.lists });
+        } else {
+          const incoming = normalize({ v: 1, lists: data.lists });
+          const used = new Set(DB.lists.map(l => l.name));
+          for (const l of incoming.lists) {
+            if (DB.lists.length >= MAX_LISTS) break;
+            let name = l.name, i = 1;
+            while (used.has(name)) { name = l.name + ' (' + (++i) + ')'; }
+            used.add(name);
+            DB.lists.push({
+              id: uid(),
+              name: name.slice(0, 40),
+              tasks: l.tasks.map(t => ({
+                id: uid(), text: t.text, done: t.done, created: t.created, doneAt: t.doneAt
+              }))
+            });
+          }
+        }
         save();
         if (ctxRef) renderAll();
         return true;
