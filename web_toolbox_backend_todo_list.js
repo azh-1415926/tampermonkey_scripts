@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页工具箱 · 任务清单模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.1.0
+// @version      1.1.1
 // @description  多清单任务 / 注意事项管理，跨页面、跨标签页同步存储，支持复制清单、编辑创建时间、导入导出备份。依赖内核 wtb-core，仅在顶层运行。
 // @author       you
 // @match        *://*/*
@@ -199,6 +199,11 @@
     let clearDoneBtn = null;
     let inputEl = null;
 
+    /* ---------- 清单栏横向滚动状态 ---------- */
+    let listsTarget = 0;      // 平滑滚动的目标位置
+    let listsRaf = 0;         // requestAnimationFrame 句柄
+    let lastActiveId = null;  // 上次渲染时的激活清单 id
+
     /* ---------- 小工具 ---------- */
     function uid() {
       return Date.now().toString(36) + '-' + (++seq).toString(36) +
@@ -262,6 +267,67 @@
       return DB.lists.find(l => l.id === DB.activeId) || DB.lists[0];
     }
 
+    /* ---------- 清单栏：滚轮横向滚动 ---------- */
+    function listsMaxScroll() {
+      if (!listsEl) return 0;
+      return Math.max(0, listsEl.scrollWidth - listsEl.clientWidth);
+    }
+
+    function listsScrollStep() {
+      listsRaf = 0;
+      if (!listsEl) return;
+      listsTarget = Math.max(0, Math.min(listsMaxScroll(), listsTarget));
+      const cur = listsEl.scrollLeft;
+      const dist = listsTarget - cur;
+      if (Math.abs(dist) < 0.5) {
+        if (dist !== 0) listsEl.scrollLeft = listsTarget;
+        return;
+      }
+      listsEl.scrollLeft = cur + dist * 0.3;
+      listsRaf = requestAnimationFrame(listsScrollStep);
+    }
+
+    function listsScrollTo(v) {
+      if (!listsEl) return;
+      listsTarget = Math.max(0, Math.min(listsMaxScroll(), v));
+      if (!listsRaf) listsRaf = requestAnimationFrame(listsScrollStep);
+    }
+
+    /** 取消平滑动画并与实际位置对齐（手动拖动、重绘前调用） */
+    function cancelListsScroll() {
+      if (listsRaf) { cancelAnimationFrame(listsRaf); listsRaf = 0; }
+      if (listsEl) listsTarget = listsEl.scrollLeft;
+    }
+
+    function bindListsWheel(el) {
+      el.addEventListener('wheel', function (e) {
+        // Ctrl/⌘ + 滚轮交给浏览器缩放
+        if (e.ctrlKey || e.metaKey) return;
+        const max = listsMaxScroll();
+        if (max <= 0) return;                       // 内容装得下，交给页面
+        // 触控板横向手势 / Shift+滚轮 让原生处理
+        if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+
+        const unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? el.clientWidth : 1);
+        const delta = (e.deltaY || 0) * unit;
+        if (!delta) return;
+
+        // 动画未运行时先与实际位置对齐
+        if (!listsRaf) listsTarget = el.scrollLeft;
+
+        // 已经顶到头还继续往外滚 → 放行，让页面正常滚动
+        if (delta < 0 && listsTarget <= 0) return;
+        if (delta > 0 && listsTarget >= max) return;
+
+        e.preventDefault();
+        listsScrollTo(listsTarget + delta);
+      }, { passive: false });
+
+      // 用户手动拖滚动条 / 触摸时，打断动画避免打架
+      el.addEventListener('pointerdown', cancelListsScroll, { passive: true });
+      el.addEventListener('touchstart', cancelListsScroll, { passive: true });
+    }
+
     /* ---------- 渲染 ---------- */
     function updateBadge() {
       let n = 0;
@@ -271,6 +337,10 @@
 
     function renderLists() {
       if (!listsEl) return;
+      cancelListsScroll();
+      // 重建 DOM 会把滚动位置清零，先记下来
+      const prevScroll = listsEl.scrollLeft;
+
       listsEl.textContent = '';
       for (const l of DB.lists) {
         const on = l.id === DB.activeId;
@@ -290,6 +360,26 @@
         });
         listsEl.appendChild(chip);
       }
+
+      // 恢复重建前的横向滚动位置
+      listsEl.scrollLeft = prevScroll;
+
+      // 仅在「激活清单发生变化」时，把它滚进可视区，避免平时乱跳
+      if (DB.activeId !== lastActiveId) {
+        const chip = listsEl.querySelector('.wtb-tk-chip.on');
+        if (chip) {
+          const cr = chip.getBoundingClientRect();
+          const lr = listsEl.getBoundingClientRect();
+          if (cr.left < lr.left) {
+            listsEl.scrollLeft -= (lr.left - cr.left) + 10;
+          } else if (cr.right > lr.right) {
+            listsEl.scrollLeft += (cr.right - lr.right) + 10;
+          }
+        }
+        lastActiveId = DB.activeId;
+      }
+
+      listsTarget = listsEl.scrollLeft;
     }
 
     function cmpTask(a, b) {
@@ -737,7 +827,9 @@
       .wtb-tk-lists {
         display: flex; align-items: center; gap: 6px;
         flex: 1 1 auto; min-width: 0;
-        overflow-x: auto; padding-bottom: 2px;
+        overflow-x: auto; overflow-y: hidden;   /* 防止纵向滚轮被容器吃掉 */
+        padding-bottom: 2px;
+        overscroll-behavior-x: contain;
       }
       .wtb-tk-lists::-webkit-scrollbar { height: 4px; }
       .wtb-tk-lists::-webkit-scrollbar-thumb { background: #3a4250; border-radius: 2px; }
@@ -914,6 +1006,9 @@
 
         pane.append(bar, addRow, bodyEl, foot);
 
+        /* --- 清单栏滚轮横向滚动 --- */
+        bindListsWheel(listsEl);
+
         /* --- 初始化数据 --- */
         load();
         unsub = store.watch(onRemoteChange);
@@ -921,6 +1016,8 @@
       },
 
       unmount(ctx) {
+        cancelListsScroll();
+        lastActiveId = null;
         if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
         ctxRef = null;
         listsEl = bodyEl = statEl = clearDoneBtn = inputEl = null;
