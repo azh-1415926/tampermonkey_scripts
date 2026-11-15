@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页工具箱 · 查找模块
 // @namespace    https://github.com/yourname/web-toolbox
-// @version      1.0.3
-// @description  跨 iframe 文本检索高亮；拾取式抓取，抓取时以元素祖先链上最近的 div 为根节点，纳入根节点内全部文本。依赖内核 wtb-core。
+// @version      1.1.0
+// @description  跨 iframe 文本检索高亮；拾取式抓取；点搜索才检索（先查当前视图，未找到再滚动遍历）；输入框内嵌历史记忆（可折叠 / 置顶 / 删除 / 清空）
 // @author       you
 // @match        *://*/*
 // @grant        unsafeWindow
@@ -39,18 +39,23 @@
     ].join(',');
     const SKIP_TAGS = new Set(['SCRIPT','STYLE','NOSCRIPT','TEXTAREA','TEMPLATE','SVG','CANVAS']);
     const MAX_MARKS = 3000;
-    const DEBOUNCE  = 180;
     const MAX_DIV_TEXT = 8000;
+
+    const MAX_SCROLL_STEPS  = 800;
+    const SCROLL_STEP_SLEEP = 90;
+    const SCROLL_STEP_RATIO = 0.9;
+    const SCROLL_TO_START_ROUNDS = 6;
+    const SCROLL_TO_START_GAP = 30;
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
 
     let styleInjected = false;
     let localContainers = [];
     let localMarks = [];
     let localCurrentIndex = -1;
 
-    /* 抓取注册表：uid -> { el: 根节点, label }（本 frame 内） */
     const localGrabbed = new Map();
 
-    /* ============ 0. 容器稳定 ID ============ */
     const uidMap = new WeakMap();
     let uidSeq = 0;
     function uidOf(el) {
@@ -208,8 +213,7 @@
     function collectTextNodes(container) {
       const out = [];
       const kind = container.kind;
-      const onlyA = (kind === 'all-links') ? true :
-                    (kind === 'div-links') ? true : false;
+      const onlyA = (kind === 'all-links' || kind === 'div-links');
       const roots = container.el
         ? [container.el]
         : Array.prototype.slice.call(document.querySelectorAll('a'));
@@ -293,7 +297,282 @@
       return localCurrentIndex;
     }
 
-    /* ============ 4. 抓取模式（拾取式） ============ */
+    /* ============ 3.x 滚动遍历辅助 ============ */
+    function isScrollableY(el) {
+      try {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.scrollHeight <= el.clientHeight + 10) return false;
+        const st = getComputedStyle(el);
+        return /(auto|scroll|overlay|hidden)/.test(st.overflowY);
+      } catch (e) { return false; }
+    }
+
+    function findScroller(rootEl) {
+      if (!rootEl) return null;
+      if (isScrollableY(rootEl)) return { type: 'native', el: rootEl, host: rootEl };
+      let best = null, bestH = 0;
+      try {
+        for (const el of rootEl.querySelectorAll('*')) {
+          if (isScrollableY(el)) {
+            const h = el.scrollHeight;
+            if (h > bestH) { best = el; bestH = h; }
+          }
+        }
+      } catch (e) {}
+      if (best) return { type: 'native', el: best, host: rootEl };
+
+      let p = rootEl.parentElement;
+      while (p && p !== document.body && p !== document.documentElement) {
+        if (isScrollableY(p)) return { type: 'native', el: p, host: rootEl };
+        p = p.parentElement;
+      }
+
+      const scrollerSels = [
+        '.d-modern-scroller',
+        '.modern-scroller',
+        '.el-scrollbar__bar',
+        '[class*="virtual-scroll"]',
+        '[class*="scrollbar"]'
+      ];
+      for (const sel of scrollerSels) {
+        const s = rootEl.querySelector(sel);
+        if (!s) continue;
+        const slider = s.querySelector('.slider, .el-scrollbar__thumb, .thumb, .thumb-vertical');
+        const track  = s.querySelector('.track') || s;
+        if (slider) return { type: 'custom', host: rootEl, scroller: s, slider, track };
+        return { type: 'wheel', host: rootEl, el: s };
+      }
+
+      const slider = rootEl.querySelector('.slider, .thumb, .thumb-vertical');
+      if (slider && slider.parentElement) {
+        const track = slider.parentElement.querySelector('.track') || slider.parentElement;
+        return { type: 'custom', host: rootEl, scroller: slider.parentElement, slider, track };
+      }
+
+      return { type: 'wheel', host: rootEl, el: rootEl };
+    }
+
+    function getCurrentScrollTop(ctrl) {
+      if (!ctrl) return 0;
+      if (ctrl.type === 'native') return ctrl.el.scrollTop;
+      if (ctrl.type === 'custom') return parseFloat(ctrl.slider.style.top) || 0;
+      return 0;
+    }
+
+    function getViewHeight(ctrl) {
+      if (!ctrl) return 400;
+      if (ctrl.type === 'native') return ctrl.el.clientHeight || 400;
+      if (ctrl.type === 'custom') {
+        const t = ctrl.track;
+        return (t && (t.clientHeight || t.offsetHeight)) || 400;
+      }
+      if (ctrl.type === 'wheel') return (ctrl.el && ctrl.el.clientHeight) || 400;
+      return 400;
+    }
+
+    function fireWheel(targets, dy) {
+      for (const t of targets) {
+        if (!t) continue;
+        try {
+          t.dispatchEvent(new WheelEvent('wheel', {
+            deltaY: dy, deltaMode: 0,
+            bubbles: true, cancelable: true, view: window
+          }));
+        } catch (e) {}
+      }
+    }
+
+    function buildWheelTargets(ctrl) {
+      const targets = new Set();
+      if (ctrl.type === 'native') return targets;
+      if (ctrl.type === 'custom') {
+        if (ctrl.host) {
+          targets.add(ctrl.host);
+          try { ctrl.host.querySelectorAll('[tabindex]').forEach(el => targets.add(el)); } catch (e) {}
+        }
+        if (ctrl.scroller) targets.add(ctrl.scroller);
+        if (ctrl.scroller && ctrl.scroller.parentElement) targets.add(ctrl.scroller.parentElement);
+        if (ctrl.slider) targets.add(ctrl.slider);
+      } else if (ctrl.type === 'wheel') {
+        if (ctrl.host) {
+          targets.add(ctrl.host);
+          try { ctrl.host.querySelectorAll('[tabindex]').forEach(el => targets.add(el)); } catch (e) {}
+        }
+        if (ctrl.el) targets.add(ctrl.el);
+      }
+      return targets;
+    }
+
+    async function scrollStep(ctrl) {
+      if (!ctrl) return { moved: false, reason: 'no-ctrl' };
+
+      if (ctrl.type === 'native') {
+        const el = ctrl.el;
+        if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
+          return { moved: false, reason: 'bottom', top: el.scrollTop };
+        }
+        const viewH = el.clientHeight || 400;
+        const step = Math.max(80, Math.min(Math.floor(viewH * SCROLL_STEP_RATIO), 600));
+        el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
+        try { el.dispatchEvent(new Event('scroll')); } catch (e) {}
+        return { moved: true, reason: 'native', top: el.scrollTop };
+      }
+
+      if (ctrl.type === 'custom') {
+        const { track, slider } = ctrl;
+        const trackH  = (track && (track.clientHeight || track.offsetHeight)) || 0;
+        const sliderH = slider.offsetHeight || 32;
+        const maxTop  = Math.max(0, trackH - sliderH);
+        const curTop  = parseFloat(slider.style.top) || 0;
+        if (maxTop > 0 && curTop >= maxTop - 2) {
+          return { moved: false, reason: 'bottom', top: curTop };
+        }
+        const viewH = getViewHeight(ctrl);
+        const dy = Math.max(200, Math.floor(viewH * SCROLL_STEP_RATIO));
+        fireWheel(buildWheelTargets(ctrl), dy);
+        return { moved: true, reason: 'wheel', top: curTop };
+      }
+
+      if (ctrl.type === 'wheel') {
+        const viewH = getViewHeight(ctrl);
+        const dy = Math.max(200, Math.floor(viewH * SCROLL_STEP_RATIO));
+        fireWheel(buildWheelTargets(ctrl), dy);
+        return { moved: true, reason: 'wheel' };
+      }
+
+      return { moved: false, reason: 'unknown' };
+    }
+
+    async function scrollToStart(ctrl) {
+      if (!ctrl) return;
+      if (ctrl.type === 'native') {
+        ctrl.el.scrollTop = 0;
+        try { ctrl.el.dispatchEvent(new Event('scroll')); } catch (e) {}
+        await sleep(120);
+        return;
+      }
+      if (ctrl.type === 'custom' || ctrl.type === 'wheel') {
+        const targets = buildWheelTargets(ctrl);
+        for (let k = 0; k < SCROLL_TO_START_ROUNDS; k++) {
+          fireWheel(targets, -99999);
+          await sleep(SCROLL_TO_START_GAP);
+        }
+        await sleep(120);
+      }
+    }
+
+    function findRowAncestor(el) {
+      let p = el, depth = 0;
+      while (p && p !== document.body && p !== document.documentElement && depth++ < 30) {
+        try {
+          if (p.hasAttribute && p.hasAttribute('rowid')) return p;
+          if (p.matches && p.matches('tr, [role="row"], li, [role="listitem"], [data-row-key], [data-index]')) return p;
+        } catch (e) {}
+        p = p.parentElement;
+      }
+      return null;
+    }
+
+    function getRowSignature(rowEl) {
+      if (!rowEl) return null;
+      const rid = rowEl.getAttribute('rowid')
+               || rowEl.getAttribute('data-row-key')
+               || rowEl.getAttribute('data-index');
+      if (rid) return 'k:' + rid;
+      const txt = (rowEl.textContent || '').trim().slice(0, 120);
+      return txt ? 't:' + txt : null;
+    }
+
+    async function runSearchLocalAsync(container, query) {
+      if (!container || !query) { clearMarks(); return 0; }
+
+      const isGrabbed = container.kind === 'grabbed'
+                     || (container.uid && localGrabbed.has(container.uid));
+      if (!isGrabbed || !container.el) {
+        return runSearchLocal(container, query);
+      }
+
+      const ctrl = findScroller(container.el);
+      if (!ctrl) return runSearchLocal(container, query);
+
+      clearMarks();
+
+      try {
+        const re = new RegExp(escapeRegExp(query), 'gi');
+
+        const rowMatches  = new Map();
+        const orphanNodes = new WeakSet();
+        let   orphanTotal = 0;
+
+        const getTotal = () => {
+          let t = orphanTotal;
+          for (const c of rowMatches.values()) t += c;
+          return t;
+        };
+
+        const scanView = () => {
+          const nodes = collectTextNodes(container);
+          for (const node of nodes) {
+            if (!node.parentElement) continue;
+            re.lastIndex = 0;
+            const m = (node.nodeValue || '').match(re);
+            if (!m || !m.length) continue;
+
+            const rowEl = findRowAncestor(node.parentElement);
+            const sig   = getRowSignature(rowEl);
+            if (sig) {
+              const prev = rowMatches.get(sig) || 0;
+              if (m.length > prev) rowMatches.set(sig, m.length);
+            } else if (!orphanNodes.has(node)) {
+              orphanNodes.add(node);
+              orphanTotal += m.length;
+            }
+          }
+        };
+
+        await scrollToStart(ctrl);
+        await sleep(150);
+        scanView();
+
+        let lastTop = getCurrentScrollTop(ctrl);
+        let noProgress = 0;
+
+        for (let step = 0; step < MAX_SCROLL_STEPS; step++) {
+          if (getTotal() >= MAX_MARKS) break;
+          const r = await scrollStep(ctrl);
+          await sleep(SCROLL_STEP_SLEEP);
+          scanView();
+
+          if (!r.moved) {
+            await sleep(150);
+            scanView();
+            break;
+          }
+
+          const curTop = getCurrentScrollTop(ctrl);
+          if (curTop === lastTop) {
+            if (++noProgress >= 4) {
+              await sleep(150);
+              scanView();
+              break;
+            }
+          } else {
+            noProgress = 0;
+            lastTop = curTop;
+          }
+        }
+
+        const total = getTotal();
+        await scrollToStart(ctrl);
+        await sleep(150);
+        runSearchLocal(container, query);
+        return total;
+      } catch (e) {
+        return runSearchLocal(container, query);
+      }
+    }
+
+    /* ============ 4. 抓取模式 ============ */
     const GRAB_EVENTS = ['mousedown','mouseup','click','dblclick','pointerdown','pointerup','contextmenu'];
     let grabEnabled = false;
     let grabAttached = false;
@@ -345,13 +624,6 @@
       return s;
     }
 
-    /**
-     * 计算抓取根节点：
-     *   从元素自身向上找第一个 div 祖先（不包含 body/html）。
-     *   - 若找到 → 该 div 为根
-     *   - 若找不到 → 退回元素自身
-     * 注意：如果元素本身就是 div，则取它更上一层的 div（"上一层div"）。
-     */
     function computeGrabRoot(el) {
       if (!el || el.nodeType !== 1) return el;
       let p = el.parentElement;
@@ -392,7 +664,6 @@
       if (!grabEnabled) return;
       const el = e.target;
       if (!el || el.nodeType !== 1 || isOwnUI(el)) { hideHighlight(); return; }
-      // 直接高亮最终的"根节点"，所见即所得
       const root = computeGrabRoot(el);
       showHighlight(root, e);
     }
@@ -451,17 +722,13 @@
         catch (e) {}
       }
 
-      // 拾取式反馈：短暂显示根节点高亮，让用户确认抓到了谁
       showHighlight(root, ev);
       setTimeout(() => { if (!grabEnabled) hideHighlight(); }, 700);
 
-      // ★ 抓取完成后自动退出抓取模式（本地 + 顶层联动）
       if (IS_TOP) {
         setGrabEnabled(false);
       } else {
-        // 子框架本地立即退出，不再拦截后续鼠标事件
         setGrabEnabled(false, true);
-        // 通知顶层也退出抓取模式（顶层会再广播给其他 iframe）
         try { window.top.postMessage({ [MSG_TAG]: true, type: 'find/grab-escape' }, '*'); }
         catch (e) {}
       }
@@ -500,22 +767,15 @@
       }
     }
 
-    /* ============ 6. 消息与状态 ============ */
+    /* ============ 6. 状态 ============ */
     let allContainers = [];
     let activeEntry = null;
     let activeCount = 0;
+    let activeTotal = 0;
     let activeIndex = -1;
-    let searchTimer = null;
+    let activeQuery = '';
     let scanTimer = null;
-    let filterKeyword = '';
 
-    const KIND_LABELS = {
-      grabbed: '已抓取根节点',
-      struct: '表格 列表',
-      'div-links': '链接容器 div',
-      'text-block': '文本 div',
-      'all-links': '其他 a 标签'
-    };
     const KIND_SHOW = {
       grabbed: '已抓取根',
       struct: '表格 / 列表',
@@ -524,13 +784,158 @@
       'all-links': '其他'
     };
 
-    let selEl = null, inputEl = null, filterEl = null,
-        prevBtn = null, nextBtn = null, statusEl = null, onlyAEl = null,
+    let selEl = null, inputEl = null,
+        prevBtn = null, nextBtn = null, statusEl = null,
         grabBtn = null, cancelGrabBtn = null, refreshBtn = null;
 
-    /* 顶层持有的单一抓取项 */
+    /* 内嵌历史区（参考任务模块风格） */
+    let histSection = null, histHead = null, histListEl = null,
+        histTitleEl = null, histArrowEl = null, histEmptyEl = null;
+    let histOpen = true;
+
     let grabbedEntry = null;
 
+    /* ============ 6.x 检索历史记忆 ============ */
+    const HISTORY_KEY = 'wtb-find-history-v1';
+    const HISTORY_MAX = 50;
+
+    function loadHistory() {
+      try {
+        const raw = localStorage.getItem(HISTORY_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return [];
+        return arr
+          .filter(x => x && typeof x.q === 'string' && x.q)
+          .map(x => ({
+            q: x.q,
+            pinned: !!x.pinned,
+            ts: typeof x.ts === 'number' ? x.ts : 0
+          }));
+      } catch (e) { return []; }
+    }
+
+    function saveHistory(list) {
+      try {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
+      } catch (e) {}
+    }
+
+    function sortHistory(list) {
+      list.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return (b.ts || 0) - (a.ts || 0);
+      });
+      return list;
+    }
+
+    function addHistory(q) {
+      q = (q || '').trim();
+      if (!q) return;
+      const list = loadHistory();
+      const idx = list.findIndex(x => x.q === q);
+      if (idx >= 0) {
+        list[idx].ts = Date.now();
+      } else {
+        list.push({ q, pinned: false, ts: Date.now() });
+      }
+      sortHistory(list);
+      saveHistory(list);
+    }
+
+    function removeHistory(q) {
+      saveHistory(loadHistory().filter(x => x.q !== q));
+    }
+
+    function togglePinHistory(q) {
+      const list = loadHistory();
+      const idx = list.findIndex(x => x.q === q);
+      if (idx < 0) return;
+      list[idx].pinned = !list[idx].pinned;
+      if (list[idx].pinned) list[idx].ts = Date.now();
+      sortHistory(list);
+      saveHistory(list);
+    }
+
+    function clearHistoryUnpinned() {
+      saveHistory(loadHistory().filter(x => x.pinned));
+    }
+
+    function clearHistoryAll() {
+      saveHistory([]);
+    }
+
+    /** 根据当前 histOpen 更新折叠状态 */
+    function applyHistOpenState() {
+      if (!histSection) return;
+      if (histOpen) histSection.classList.add('is-open');
+      else histSection.classList.remove('is-open');
+      if (histArrowEl) histArrowEl.textContent = histOpen ? '▾' : '▸';
+    }
+
+    /** 重新渲染历史列表（保持展开状态） */
+    function renderHistorySection() {
+      if (!histListEl || !histTitleEl) return;
+      const list = sortHistory(loadHistory());
+
+      if (histTitleEl) {
+        histTitleEl.textContent = '📜 历史记录 (' + list.length + ')';
+      }
+
+      histListEl.innerHTML = '';
+
+      if (!list.length) {
+        histListEl.appendChild(
+          h('div', { class: 'wtb-find-hist-empty' }, '暂无历史记录')
+        );
+        return;
+      }
+
+      for (const item of list) {
+        const row = h('div', { class: 'wtb-find-hist-item' });
+
+        const txt = h('span', {
+          class: 'wtb-find-hist-text',
+          title: item.q
+        }, item.q);
+        txt.addEventListener('click', () => {
+          if (!inputEl) return;
+          inputEl.value = item.q;
+          try { inputEl.dispatchEvent(new Event('input')); } catch (e) {}
+          try { inputEl.focus(); } catch (e) {}
+          updateStatus();
+        });
+        row.appendChild(txt);
+
+        const pin = h('button', {
+          type: 'button',
+          class: 'wtb-find-hist-icon' + (item.pinned ? ' is-pinned' : ''),
+          title: item.pinned ? '取消置顶' : '置顶'
+        }, item.pinned ? '📌' : '📍');
+        pin.addEventListener('click', e => {
+          e.stopPropagation();
+          togglePinHistory(item.q);
+          renderHistorySection();
+        });
+        row.appendChild(pin);
+
+        const del = h('button', {
+          type: 'button',
+          class: 'wtb-find-hist-icon danger',
+          title: '删除'
+        }, '✕');
+        del.addEventListener('click', e => {
+          e.stopPropagation();
+          removeHistory(item.q);
+          renderHistorySection();
+        });
+        row.appendChild(del);
+
+        histListEl.appendChild(row);
+      }
+    }
+
+    /* ============ 6.y 抓取/检索核心（与之前一致） ============ */
     function isGrabbed(entry) {
       return !!(grabbedEntry && entry &&
         entry.frameId === grabbedEntry.frameId && entry.uid === grabbedEntry.uid);
@@ -559,21 +964,19 @@
         allContainers.push(entry);
       }
       activeEntry = entry;
+      activeCount = 0; activeTotal = 0; activeIndex = -1; activeQuery = '';
       refreshSelectionAndSearch();
     }
 
-    /**
-     * ★ 取消本次抓取：
-     *   清空顶层抓取项 + 通知所有 frame 清空各自的 localGrabbed，
-     *   然后重新索引全部控件（重新扫描所有 iframe）。
-     */
     function cancelGrab() {
       grabbedEntry = null;
       localGrabbed.clear();
       broadcastToChildren({ [MSG_TAG]: true, type: 'find/grab-clear' });
       activeEntry = null;
       activeCount = 0;
+      activeTotal = 0;
       activeIndex = -1;
+      activeQuery = '';
       resetAllFramesHighlight();
       rescan();
       updateStatus();
@@ -595,8 +998,16 @@
       }
       const q = inputEl ? inputEl.value.trim() : '';
       if (!q) { statusEl.innerHTML = '输入文本开始检索' + scope; return; }
-      if (!activeCount) { statusEl.innerHTML = '未找到匹配项' + scope; return; }
-      statusEl.innerHTML = '匹配 <b>' + activeCount + '</b> 项 ｜ 当前第 <b>' + (activeIndex + 1) + '</b> 项' +
+      if (activeQuery !== q) {
+        statusEl.innerHTML = '点击 <b>🔍</b> 或按回车检索' + scope;
+        return;
+      }
+      if (!activeTotal) { statusEl.innerHTML = '未找到匹配项' + scope; return; }
+      const navPart = activeCount > 0
+        ? ' ｜ 可视 <b>' + activeCount + '</b> 项 · 当前第 <b>' + (activeIndex + 1) + '</b>'
+        : '';
+      statusEl.innerHTML =
+        '匹配 <b>' + activeTotal + '</b> 项' + navPart +
         ' ｜ 来源：' + activeEntry.frameLabel + scope;
     }
 
@@ -616,18 +1027,9 @@
       let filtered = allContainers;
       if (grabActive()) filtered = filtered.filter(isGrabbed);
 
-      const kw = filterKeyword.trim().toLowerCase();
-      if (kw) {
-        filtered = filtered.filter(c => {
-          const haystack = (c.label + ' ' + (c.frameLabel || '') + ' ' + (KIND_LABELS[c.kind] || '')).toLowerCase();
-          return haystack.indexOf(kw) > -1;
-        });
-      }
-
       if (!filtered.length) {
         const o = document.createElement('option');
-        if (grabActive() && !kw) o.textContent = '已抓取的控件暂不可用';
-        else o.textContent = '没有匹配「' + (filterKeyword || '') + '」的选项';
+        o.textContent = grabActive() ? '已抓取的控件暂不可用' : '没有可用选项';
         selEl.appendChild(o);
         selEl.disabled = true;
         const prev = activeEntry;
@@ -707,37 +1109,64 @@
       broadcastToChildren({ [MSG_TAG]: true, type: 'find/clear' });
     }
 
-    function doSearch(query) {
+    async function doSearch(query, forceFull) {
       resetAllFramesHighlight();
       activeCount = 0;
+      activeTotal = 0;
       activeIndex = -1;
+      activeQuery = '';
       if (!activeEntry || !query) { updateStatus(); return; }
+      activeQuery = query;
+
+      /* 记录历史 + 刷新内嵌历史区 */
+      addHistory(query);
+      try { renderHistorySection(); } catch (e) {}
 
       if (activeEntry.frameId === FRAME_ID) {
         const c = findLocalContainerByUid(activeEntry.uid);
-        const count = runSearchLocal(c, query);
-        activeCount = count > 0 ? count : 0;
+        if (!c) { updateStatus(); return; }
+
+        let total;
+        try {
+          if (forceFull) {
+            if (statusEl) statusEl.textContent = '正在滚动遍历检索…';
+            total = await runSearchLocalAsync(c, query);
+          } else {
+            if (statusEl) statusEl.textContent = '检索中…';
+            total = runSearchLocal(c, query);
+            if (total === 0) {
+              if (statusEl) statusEl.textContent = '当前视图未找到，正在滚动遍历…';
+              total = await runSearchLocalAsync(c, query);
+            }
+          }
+        } catch (e) { total = 0; }
+        activeTotal = total > 0 ? total : 0;
+        activeCount = localMarks.length;
         activeIndex = localCurrentIndex;
         updateStatus();
       } else {
+        if (statusEl) statusEl.textContent = '正在目标 frame 检索…';
         broadcastToChildren({
           [MSG_TAG]: true, type: 'find/run',
           frameId: activeEntry.frameId,
           containerUid: activeEntry.uid,
-          query: query
+          query: query,
+          forceFull: !!forceFull
         });
-        updateStatus();
       }
     }
 
     function doGoto(delta) {
-      if (!activeEntry || !activeCount) return;
-      const newIndex = ((activeIndex + delta) % activeCount + activeCount) % activeCount;
+      if (!activeEntry) return;
       if (activeEntry.frameId === FRAME_ID) {
+        if (!localMarks.length) return;
+        const newIndex = ((localCurrentIndex + delta) % localMarks.length + localMarks.length) % localMarks.length;
         goToLocal(newIndex);
         activeIndex = localCurrentIndex;
         updateStatus();
       } else {
+        if (!activeCount) return;
+        const newIndex = ((activeIndex + delta) % activeCount + activeCount) % activeCount;
         broadcastToChildren({
           [MSG_TAG]: true, type: 'find/goto',
           frameId: activeEntry.frameId,
@@ -749,22 +1178,24 @@
     function refreshSelectionAndSearch() {
       const r = buildSelect();
       const q = inputEl ? inputEl.value.trim() : '';
-      if (r && r.changed && activeEntry) {
-        if (q) doSearch(q);
-        else { resetAllFramesHighlight(); updateStatus(); }
+      if (r && r.changed && activeEntry && q) {
+        doSearch(q, false);
       } else {
         updateStatus();
       }
     }
 
-    /** ★ 用当前输入框内容重新执行一次检索（刷新高亮） */
     function refreshSearch() {
-      clearTimeout(searchTimer);
       const q = inputEl ? inputEl.value.trim() : '';
-      if (!q) { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); return; }
+      if (!q) {
+        resetAllFramesHighlight();
+        activeCount = 0; activeTotal = 0; activeIndex = -1; activeQuery = '';
+        updateStatus();
+        return;
+      }
       if (!activeEntry && allContainers.length) buildSelect();
       if (!activeEntry) { updateStatus(); return; }
-      doSearch(q);
+      doSearch(q, true);
     }
 
     function rescan() {
@@ -799,9 +1230,7 @@
       clearTimeout(scanTimer);
       scanTimer = setTimeout(() => {
         buildSelect();
-        const q = inputEl ? inputEl.value.trim() : '';
-        if (q) doSearch(q);
-        else updateStatus();
+        updateStatus();
       }, 500);
     }
 
@@ -830,11 +1259,7 @@
 
       if (d.type === 'find/clear') { clearMarks(); return; }
 
-      // ★ 清空本 frame 的抓取注册表
-      if (d.type === 'find/grab-clear') {
-        localGrabbed.clear();
-        return;
-      }
+      if (d.type === 'find/grab-clear') { localGrabbed.clear(); return; }
 
       if (d.type === 'find/grab-toggle') {
         setGrabEnabled(d.enabled, true);
@@ -842,15 +1267,31 @@
       }
 
       if (d.type === 'find/run' && d.frameId === FRAME_ID) {
-        let c = d.containerUid ? findLocalContainerByUid(d.containerUid) : null;
-        if (!c && typeof d.containerIdx === 'number') c = localContainers[d.containerIdx];
+        const c = d.containerUid ? findLocalContainerByUid(d.containerUid) : null;
         if (!c) return;
-        const count = runSearchLocal(c, d.query);
-        toTop({
-          [MSG_TAG]: true, type: 'find/run-result',
-          frameId: FRAME_ID,
-          count: count > 0 ? count : 0,
-          currentIndex: localCurrentIndex
+        (async () => {
+          let total;
+          if (d.forceFull) {
+            total = await runSearchLocalAsync(c, d.query);
+          } else {
+            total = runSearchLocal(c, d.query);
+            if (total === 0) total = await runSearchLocalAsync(c, d.query);
+          }
+          return total;
+        })().then(total => {
+          toTop({
+            [MSG_TAG]: true, type: 'find/run-result',
+            frameId: FRAME_ID,
+            total: total > 0 ? total : 0,
+            visibleCount: localMarks.length,
+            currentIndex: localCurrentIndex
+          });
+        }).catch(() => {
+          toTop({
+            [MSG_TAG]: true, type: 'find/run-result',
+            frameId: FRAME_ID,
+            total: 0, visibleCount: 0, currentIndex: -1
+          });
         });
         return;
       }
@@ -869,12 +1310,22 @@
       if (IS_TOP) {
         if (d.type === 'find/scan-result') {
           for (const c of d.containers) {
-            allContainers.push({
-              frameId: d.frameId, frameLabel: d.frameLabel,
-              idx: c.idx, uid: c.uid, kind: c.kind, label: c.label
-            });
+            const exists = allContainers.some(x => x.frameId === d.frameId && x.uid === c.uid);
+            if (!exists) {
+              allContainers.push({
+                frameId: d.frameId, frameLabel: d.frameLabel,
+                idx: c.idx, uid: c.uid, kind: c.kind, label: c.label
+              });
+            }
           }
-        } else if (d.type === 'find/run-result' || d.type === 'find/goto-result') {
+        } else if (d.type === 'find/run-result') {
+          if (activeEntry && activeEntry.frameId === d.frameId) {
+            activeTotal = d.total != null ? d.total : (d.count || 0);
+            activeCount = d.visibleCount != null ? d.visibleCount : (d.count || 0);
+            activeIndex = d.currentIndex;
+            updateStatus();
+          }
+        } else if (d.type === 'find/goto-result') {
           if (activeEntry && activeEntry.frameId === d.frameId) {
             activeCount = d.count;
             activeIndex = d.currentIndex;
@@ -912,7 +1363,7 @@
       handleMessage(d);
     }, false);
 
-    /* ============ 7. 初始化（所有 frame） ============ */
+    /* ============ 7. 初始化 ============ */
     injectStyle();
     localContainers = scanContainers();
 
@@ -935,6 +1386,93 @@
         font-weight: 600;
       }
       .wtb-btn[disabled] { opacity: .45; cursor: not-allowed; }
+
+      /* ---- 内嵌历史区（参考任务模块风格） ---- */
+      .wtb-find-hist-section {
+        margin-top: 8px;
+        border: 1px solid #2c333e;
+        border-radius: 6px;
+        overflow: hidden;
+        background: #1b2029;
+      }
+
+      .wtb-find-hist-head {
+        display: flex; align-items: center; gap: 4px;
+        padding: 5px 8px;
+        background: #222833;
+        border-bottom: 1px solid #2c333e;
+        font-size: 11px; color: #8b94a3;
+        cursor: pointer;
+        user-select: none;
+      }
+      .wtb-find-hist-head:hover { color: #d8dde5; }
+      .wtb-find-hist-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wtb-find-hist-arrow { flex: 0 0 auto; transition: transform .15s; }
+
+      .wtb-find-hist-head .wtb-find-hist-tool {
+        flex: 0 0 auto;
+        padding: 1px 6px;
+        background: transparent;
+        border: 1px solid #2c333e;
+        border-radius: 3px;
+        color: #8b94a3;
+        cursor: pointer;
+        font-size: 10px;
+        font-family: inherit;
+        line-height: 1.4;
+      }
+      .wtb-find-hist-head .wtb-find-hist-tool:hover {
+        color: #d8dde5; border-color: #3a7bd5;
+      }
+
+      .wtb-find-hist-section:not(.is-open) .wtb-find-hist-list { display: none; }
+
+      .wtb-find-hist-list {
+        max-height: 140px;
+        overflow-y: auto;
+        padding: 2px 0;
+      }
+      .wtb-find-hist-list::-webkit-scrollbar { width: 4px; }
+      .wtb-find-hist-list::-webkit-scrollbar-thumb { background: #3a4250; border-radius: 2px; }
+      .wtb-find-hist-list::-webkit-scrollbar-track { background: transparent; }
+
+      .wtb-find-hist-item {
+        display: flex; align-items: center; gap: 4px;
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+      .wtb-find-hist-item:hover { background: #262c36; }
+
+      .wtb-find-hist-text {
+        flex: 1 1 auto; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        color: #d8dde5;
+        cursor: pointer;
+      }
+      .wtb-find-hist-text:hover { color: #7fd3ff; }
+
+      .wtb-find-hist-icon {
+        flex: 0 0 auto;
+        width: 16px; height: 16px; padding: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: transparent; border: 0; border-radius: 3px;
+        color: #6f7a8c;
+        font-size: 10px; line-height: 1; font-family: inherit;
+        cursor: pointer;
+        opacity: .35;
+        transition: opacity .12s, background .12s, color .12s;
+      }
+      .wtb-find-hist-item:hover .wtb-find-hist-icon { opacity: 1; }
+      .wtb-find-hist-icon.is-pinned { opacity: 1; color: #ffd166; }
+      .wtb-find-hist-icon:hover { color: #8fc4ff; background: #2a3140; }
+      .wtb-find-hist-icon.danger:hover { color: #ff6b6b; background: #3a2528; }
+
+      .wtb-find-hist-empty {
+        padding: 10px 8px;
+        text-align: center;
+        color: #6f7a8c;
+        font-size: 11px;
+      }
     `;
 
     bus.registerModule({
@@ -947,47 +1485,78 @@
         const pane = ctx.pane;
         pane.innerHTML = '';
 
-        filterEl  = h('input', { type: 'text', placeholder: '🔎 过滤下拉框选项（名称 / 类别 / 来源）' });
-        const rescanBtn = h('button', { class: 'wtb-btn ghost', title: '重新扫描' }, '⟳');
-        const row1 = h('div', { class: 'wtb-row' }, [filterEl, rescanBtn]);
-
+        /* 第 1 行：容器下拉框 + 重新扫描 */
         selEl = h('select');
         selEl.style.flex = '1';
-        const row2 = h('div', { class: 'wtb-row' }, [selEl]);
+        const rescanBtn = h('button', { type: 'button', class: 'wtb-btn ghost', title: '重新扫描' }, '⟳');
+        const row1 = h('div', { class: 'wtb-row' }, [selEl, rescanBtn]);
 
-        inputEl = h('input', { type: 'text', placeholder: '输入要检索的文本，回车切换下一项' });
+        /* 第 2 行：输入框 + 搜索 + 刷新（完整）+ 清空 */
+        inputEl = h('input', { type: 'text', placeholder: '输入要检索的文本，点 🔍 或按回车检索' });
         inputEl.style.flex = '1';
-        // ★ 第二个输入框的刷新按钮：用当前关键词重新高亮，无需重新输入
-        refreshBtn = h('button', { class: 'wtb-btn ghost', title: '刷新高亮（用当前关键词重新检索一次）' }, '↻');
-        const clearBtn = h('button', { class: 'wtb-btn ghost', title: '清空输入框' }, '✕');
-        const row3 = h('div', { class: 'wtb-row' }, [inputEl, refreshBtn, clearBtn]);
+        const searchBtn = h('button', { type: 'button', class: 'wtb-btn', title: '检索：先查找当前视图，未找到再自动滚动遍历' }, '🔍');
+        refreshBtn = h('button', { type: 'button', class: 'wtb-btn ghost', title: '完整检索：滚动遍历整个列表后高亮（手动刷新）' }, '↻');
+        const clearBtn = h('button', { type: 'button', class: 'wtb-btn ghost', title: '清空输入框' }, '✕');
+        const row2 = h('div', { class: 'wtb-row' }, [inputEl, searchBtn, refreshBtn, clearBtn]);
 
-        prevBtn = h('button', { class: 'wtb-btn ghost' }, '↑ 上一个');
+        /* 第 3 行：导航 */
+        prevBtn = h('button', { type: 'button', class: 'wtb-btn ghost' }, '↑ 上一个');
         prevBtn.style.flex = '1';
-        nextBtn = h('button', { class: 'wtb-btn ghost' }, '↓ 下一个');
+        nextBtn = h('button', { type: 'button', class: 'wtb-btn ghost' }, '↓ 下一个');
         nextBtn.style.flex = '1';
-        const row4 = h('div', { class: 'wtb-row' }, [prevBtn, nextBtn]);
+        const row3 = h('div', { class: 'wtb-row' }, [prevBtn, nextBtn]);
 
+        /* 第 4 行：抓取 */
         grabBtn = h('button', {
+          type: 'button',
           class: 'wtb-btn ghost wtb-find-grab',
-          title: '单击页面元素，将以该元素上一层 div 为根节点，根节点内全部文本纳入检索范围'
+          title: '单击页面元素，将以该元素上一层 div 为根节点；抓取后点 🔍 检索，未找到再滚动遍历'
         }, '📌 抓取控件');
         grabBtn.style.flex = '1';
-        // ★ 取消本次抓取 + 重新索引全部控件
         cancelGrabBtn = h('button', {
-          class: 'wtb-btn ghost',
+          type: 'button', class: 'wtb-btn ghost',
           title: '取消本次抓取，并重新索引页面（含所有 iframe）的全部控件'
         }, '✖ 取消抓取');
         cancelGrabBtn.disabled = true;
-        const row5 = h('div', { class: 'wtb-row' }, [grabBtn, cancelGrabBtn]);
+        const row4 = h('div', { class: 'wtb-row' }, [grabBtn, cancelGrabBtn]);
 
-        onlyAEl = h('input', { type: 'checkbox', checked: true });
-        const row6 = h('div', { class: 'wtb-row' }, [
-          h('label', { class: 'wtb-switch', title: '仅对“链接容器 div”这一类别生效' }, [
-            onlyAEl, h('span', { class: 'track' }),
-            h('span', {}, '链接容器 div 仅检索链接文本')
-          ])
+        /* 内嵌历史区（参考任务模块的折叠式列表） */
+        histTitleEl = h('span', { class: 'wtb-find-hist-title' }, '📜 历史记录 (0)');
+        histArrowEl = h('span', { class: 'wtb-find-hist-arrow' }, '▾');
+
+        const clearUnpinnedBtn = h('button', {
+          type: 'button', class: 'wtb-find-hist-tool', title: '清空未置顶的历史'
+        }, '清空未置顶');
+        const clearAllBtn = h('button', {
+          type: 'button', class: 'wtb-find-hist-tool', title: '清空全部历史'
+        }, '清空全部');
+
+        histHead = h('div', { class: 'wtb-find-hist-head' }, [
+          histTitleEl, clearUnpinnedBtn, clearAllBtn, histArrowEl
         ]);
+        histListEl = h('div', { class: 'wtb-find-hist-list' });
+        histSection = h('div', { class: 'wtb-find-hist-section' }, [histHead, histListEl]);
+
+        /* 折叠头点击：切换展开状态（避开内部按钮） */
+        histHead.addEventListener('click', e => {
+          if (e.target === clearUnpinnedBtn || e.target === clearAllBtn) return;
+          histOpen = !histOpen;
+          applyHistOpenState();
+        });
+
+        clearUnpinnedBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          clearHistoryUnpinned();
+          renderHistorySection();
+        });
+        clearAllBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          try {
+            if (!window.confirm('确定清空全部历史记录？')) return;
+          } catch (err) {}
+          clearHistoryAll();
+          renderHistorySection();
+        });
 
         statusEl = h('div', { class: 'wtb-find-status' }, '初始化中…');
 
@@ -995,34 +1564,12 @@
         pane.appendChild(row2);
         pane.appendChild(row3);
         pane.appendChild(row4);
-        pane.appendChild(row5);
-        pane.appendChild(row6);
+        pane.appendChild(histSection);
         pane.appendChild(statusEl);
 
+        /* --- 事件 --- */
         const syncClearBtn = () => { clearBtn.disabled = !inputEl.value; };
         syncClearBtn();
-
-        filterEl.addEventListener('input', () => {
-          filterKeyword = filterEl.value;
-          const r = buildSelect();
-          if (r && r.changed && activeEntry) {
-            const q = inputEl.value.trim();
-            if (q) doSearch(q);
-            else { resetAllFramesHighlight(); updateStatus(); }
-          } else updateStatus();
-        });
-        filterEl.addEventListener('keydown', e => {
-          if (e.key === 'Escape') {
-            if (filterEl.value) {
-              filterEl.value = ''; filterKeyword = '';
-              buildSelect(); updateStatus();
-            } else filterEl.blur();
-            e.stopPropagation();
-          } else if (e.key === 'Enter') {
-            e.preventDefault();
-            inputEl.focus(); inputEl.select();
-          }
-        });
 
         selEl.addEventListener('change', () => {
           const sep = selEl.value.indexOf('#');
@@ -1030,46 +1577,45 @@
           const fid = selEl.value.slice(0, sep);
           const uid = selEl.value.slice(sep + 1);
           activeEntry = allContainers.find(c => c.frameId === fid && c.uid === uid) || null;
-          activeCount = 0; activeIndex = -1;
-          const q = inputEl.value.trim();
-          if (q) doSearch(q);
-          else { resetAllFramesHighlight(); updateStatus(); }
+          activeCount = 0; activeTotal = 0; activeIndex = -1; activeQuery = '';
+          resetAllFramesHighlight();
+          updateStatus();
         });
 
         inputEl.addEventListener('input', () => {
           syncClearBtn();
-          clearTimeout(searchTimer);
-          searchTimer = setTimeout(() => doSearch(inputEl.value.trim()), DEBOUNCE);
+          updateStatus();
         });
+
         inputEl.addEventListener('keydown', e => {
           if (e.key === 'Enter') {
             e.preventDefault();
-            clearTimeout(searchTimer);
             const q = inputEl.value.trim();
-            if (!activeCount) doSearch(q);
-            else doGoto(e.shiftKey ? -1 : 1);
+            if (!q) return;
+            if (activeQuery === q && activeCount > 0) {
+              doGoto(e.shiftKey ? -1 : 1);
+            } else {
+              if (!activeEntry && allContainers.length) buildSelect();
+              if (!activeEntry) { updateStatus(); return; }
+              doSearch(q, false);
+            }
           } else if (e.key === 'Escape') {
             inputEl.value = '';
             syncClearBtn();
-            clearTimeout(searchTimer);
             resetAllFramesHighlight();
-            activeCount = 0; activeIndex = -1;
+            activeCount = 0; activeTotal = 0; activeIndex = -1; activeQuery = '';
             updateStatus();
           }
         });
 
-        clearBtn.addEventListener('click', () => {
-          inputEl.value = '';
-          syncClearBtn();
-          clearTimeout(searchTimer);
-          resetAllFramesHighlight();
-          activeCount = 0;
-          activeIndex = -1;
-          updateStatus();
-          inputEl.focus();
+        searchBtn.addEventListener('click', () => {
+          const q = inputEl.value.trim();
+          if (!q) { inputEl.focus(); return; }
+          if (!activeEntry && allContainers.length) buildSelect();
+          if (!activeEntry) { updateStatus(); return; }
+          doSearch(q, false);
         });
 
-        // ★ 刷新按钮：重新执行当前检索，刷新高亮标记
         refreshBtn.addEventListener('click', () => {
           refreshSearch();
           refreshBtn.textContent = '✓';
@@ -1077,48 +1623,67 @@
           refreshBtn._t = setTimeout(() => { refreshBtn.textContent = '↻'; }, 700);
         });
 
+        clearBtn.addEventListener('click', () => {
+          inputEl.value = '';
+          syncClearBtn();
+          resetAllFramesHighlight();
+          activeCount = 0;
+          activeTotal = 0;
+          activeIndex = -1;
+          activeQuery = '';
+          updateStatus();
+          inputEl.focus();
+        });
+
         prevBtn.addEventListener('click', () => doGoto(-1));
         nextBtn.addEventListener('click', () => doGoto(1));
         rescanBtn.addEventListener('click', rescan);
-        onlyAEl.addEventListener('change', () => {
-          const q = inputEl.value.trim();
-          if (q) doSearch(q);
-          else { resetAllFramesHighlight(); updateStatus(); }
-        });
 
-        /* 抓取按钮：进入/退出抓取模式 */
         grabBtn.addEventListener('click', () => {
           setGrabEnabled(!grabEnabled);
           updateStatus();
         });
 
-        /* ★ 取消抓取按钮：清空抓取项 + 重新索引全部控件 */
-        cancelGrabBtn.addEventListener('click', () => {
-          cancelGrab();
-        });
+        cancelGrabBtn.addEventListener('click', () => { cancelGrab(); });
 
         rescan();
+        applyHistOpenState();
+        renderHistorySection();
         setTimeout(() => { if (!allContainers.length) rescan(); }, 1500);
       },
       unmount() {
-        clearTimeout(searchTimer);
         clearTimeout(scanTimer);
         if (IS_TOP) setGrabEnabled(false);
         resetAllFramesHighlight();
+        histSection = null;
+        histHead = null;
+        histListEl = null;
+        histTitleEl = null;
+        histArrowEl = null;
       }
     });
 
     /* 对外 API */
     bus.find = {
       rescan,
-      search: q => doSearch(q),
+      search: q => doSearch(q, false),
+      searchFull: q => doSearch(q, true),
       next: () => doGoto(1),
       prev: () => doGoto(-1),
-      clear: () => { resetAllFramesHighlight(); activeCount = 0; activeIndex = -1; updateStatus(); },
+      clear: () => {
+        resetAllFramesHighlight();
+        activeCount = 0; activeTotal = 0; activeIndex = -1; activeQuery = '';
+        updateStatus();
+      },
       refresh: () => refreshSearch(),
       grabMode: on => setGrabEnabled(!!on),
       cancelGrab: () => cancelGrab(),
-      hasGrab: () => !!grabbedEntry
+      hasGrab: () => !!grabbedEntry,
+      getHistory: () => sortHistory(loadHistory()),
+      clearHistory: () => {
+        clearHistoryAll();
+        try { renderHistorySection(); } catch (e) {}
+      }
     };
   }
 
